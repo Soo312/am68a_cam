@@ -1,0 +1,16 @@
+# Qt/C++ build outputs
+build-*/ 
+*.o
+*.obj
+*.so
+*.dll
+*.exe
+*.dylib
+*.app
+*.user
+*.pro.user
+*.qbs.user
+*.qmlc
+*.jsc
+*.log
+CMakeLists.txt.user
