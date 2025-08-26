@@ -14,7 +14,7 @@
 #include <Base/GCException.h>
 using namespace std;
 
-CaptureWorker::CaptureWorker(QString hint,bool isToF, QObject* p)
+CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
     :QObject(p), hint_(std::move(hint)), isToF_(isToF){}
 CaptureWorker::~CaptureWorker(){stop();closeDevice();}
 
@@ -218,7 +218,7 @@ void CaptureWorker::start()
             if(!img) continue;
             if(!isToF_)
             {
-                emit frameReady(toQImage2D(img));
+                emit frameReady(camIdx,toQImage2D(img));
             }
             else
             {
@@ -247,8 +247,13 @@ CameraWorker::CameraWorker(QWidget *parent)
     //"192.168.1.150";//HTR003S-001     //"192.168.1.151";//TRI032S-CC
     QString hint = "192.168.1.151";//TRI032S-CC
     bool isToF = false;
+    int camIdx = -1;
+    if(hint == "192.168.1.151")
+        camIdx = 0;
+    else if(hint == "192.168.1.150")
+        camIdx = 1;
 
-    worker_ = new CaptureWorker(hint, isToF);
+    worker_ = new CaptureWorker(hint,camIdx, isToF);
     worker_->moveToThread(&thread_);
     connect(&thread_, &QThread::started, worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, worker_, &CaptureWorker::stop);
@@ -279,7 +284,7 @@ void CameraWorker::onStart()
     thread_.start();
 }
 
-void CameraWorker::onFrame(const QImage& img)
+void CameraWorker::onFrame(int camidx ,const QImage& img)
 {
     if(img.isNull())return;
     lastFrame_ = img;
@@ -310,11 +315,11 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
     if (ok && !qimg.isNull())
     {
         lastOk = qimg;
-        emit frameReady(qimg);
+        emit frameReady(camIdx,qimg);
     }
     else if (!lastOk.isNull())
     {
-        emit frameReady(lastOk);   // 실패 프레임은 화면 유지
+        emit frameReady(camIdx,lastOk);   // 실패 프레임은 화면 유지
     }
 }
 

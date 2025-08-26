@@ -18,7 +18,7 @@ class CaptureWorker : public QObject
     Q_OBJECT
 
 public:
-    explicit CaptureWorker(QString deviceHint, bool isToF=false, QObject* parent=nullptr);
+    explicit CaptureWorker(QString deviceHint, bool isToF=false,int camIdx = -1, QObject* parent=nullptr);
     ~CaptureWorker();
 public slots:
     void start();
@@ -26,7 +26,7 @@ public slots:
 
 signals:
     //void frameReady(const QImage& img, const QImage& img2);
-    void frameReady(QImage img);
+    void frameReady(int camidx,QImage img);
     void errorOccurred(const QString& msg);
 
 public slots:
@@ -44,6 +44,10 @@ private:
     Arena::IDevice* dev_ = nullptr;
 
 
+public:
+    int camIdx = -1;
+
+
 };
 
 class CameraWorker : public QMainWindow {
@@ -54,7 +58,7 @@ public:
 private slots:
   void onStart();
   void onSnapshot();
-  void onFrame(const QImage& img);
+  void onFrame(int camidx, const QImage& img);
 
 private:
   Ui::CameraWorker* ui;
