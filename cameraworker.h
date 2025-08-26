@@ -45,7 +45,7 @@ private:
 
 
 public:
-    int camIdx = -1;
+    int camIdx_ = -1;
 
 
 };

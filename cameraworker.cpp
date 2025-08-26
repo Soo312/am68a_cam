@@ -15,7 +15,7 @@
 using namespace std;
 
 CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
-    :QObject(p), hint_(std::move(hint)), isToF_(isToF){}
+    :QObject(p), hint_(std::move(hint)), isToF_(isToF),camIdx_(camIdx){}
 CaptureWorker::~CaptureWorker(){stop();closeDevice();}
 
 bool CaptureWorker::openDevice()
@@ -29,23 +29,23 @@ bool CaptureWorker::openDevice()
         if(devs.empty()) return false;
 
         size_t idx = 0;
+        Arena::DeviceInfo* target = nullptr;
         if(!hint_.isEmpty())
         {
-            for(size_t i=0;i<devs.size();++i)
+            for (auto& d : devs)
             {
-                const QString ip     = QString::fromLatin1(devs[i].IpAddressStr().c_str());
-                const QString serial = QString::fromLatin1(devs[i].SerialNumber().c_str());   // 일부 SDK는 SerialNumberStr()일 수도 있음
-                const QString mac    = QString::fromLatin1(devs[i].MacAddressStr().c_str());
-
-                if(ip == hint_ || serial == hint_ || mac == hint_)
+                const QString ip     = QString::fromLatin1(d.IpAddressStr().c_str());
+                const QString serial = QString::fromLatin1(d.SerialNumber().c_str());
+                const QString mac    = QString::fromLatin1(d.MacAddressStr().c_str());
+                if (ip == hint_ || serial == hint_ || mac == hint_)
                 {
-                    idx = i;
+                    target = &d;                       // << 인덱스 대신 DeviceInfo 복사
                     break;
                 }
             }
         }
 
-        dev_ = sys_->CreateDevice(devs.at(idx));
+        dev_ = sys_->CreateDevice(*target);
         return true;
     }
     catch (...)
@@ -128,15 +128,18 @@ void CaptureWorker::start()
     if (auto n = GenApi::CEnumerationPtr(dMap->GetNode("AcquisitionMode")); GenApi::IsWritable(n)) n->FromString("Continuous");
 
     // 2) 스트림 계층: 자동 MTU 협상 끄기
-    if (auto n = GenApi::CBooleanPtr(sMap->GetNode("StreamAutoNegotiatePacketSize")); GenApi::IsWritable(n)) n->SetValue(false);
+    if (auto n = GenApi::CBooleanPtr(sMap->GetNode("StreamAutoNegotiatePacketSize")); GenApi::IsWritable(n))
+        n->SetValue(false);
 
     // 3) 장치 측 패킷 크기 “작게” 고정 (MTU=1500 환경에서도 100% 붙는 값부터 시도)
-    if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPSPacketSize")); GenApi::IsWritable(n)) n->SetValue(1400);
+    if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPSPacketSize")); GenApi::IsWritable(n))
+        n->SetValue(1400);
     // 1440이 일반 안전값이지만, 스위치/보드 조합에 따라 1400이 더 확실할 때가 많다.
     // 그래도 안 되면 1300 → 1200 → 1000 순으로 내려가며 시도.
 
     // 4) 인터패킷 딜레이로 혼잡 완화 (필요 시 값 ↑)
-    if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPD")); GenApi::IsWritable(n)) n->SetValue(5000);
+    if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPD")); GenApi::IsWritable(n))
+        n->SetValue(5000);
     // 여전히 타임아웃이면 10000, 20000까지도 올려볼 수 있음 (나노초 단위인 경우 多).
 
     // 5) 패킷 재전송 켜기 (유실 대비)
@@ -147,10 +150,14 @@ void CaptureWorker::start()
 
     // 7) (강력 권장) 링크 스루풋 제한으로 초반 폭주 방지
     //    모드가 있으면 켜고 적당한 bps로 제한 (예: 80 Mbps)
-    if (auto m = GenApi::CEnumerationPtr(dMap->GetNode("DeviceLinkThroughputLimitMode"));
-        GenApi::IsWritable(m)) m->FromString("On");
-    if (auto v = GenApi::CIntegerPtr(dMap->GetNode("DeviceLinkThroughputLimit"));
-        GenApi::IsWritable(v)) v->SetValue(80'000'000); // 80 Mbps
+    if (auto m = GenApi::CEnumerationPtr(dMap->GetNode("DeviceLinkThroughputLimitMode")); GenApi::IsWritable(m))
+        m->FromString("Off");
+    if (auto v = GenApi::CIntegerPtr(dMap->GetNode("DeviceLinkThroughputLimit")); GenApi::IsWritable(v))
+    {
+        int64_t hi = v->GetMax();
+        int64_t lo = v->GetMin();
+        v->SetValue(std::max<int64_t>(hi,lo));
+    }
 
     //장치 이름 확인
     std::string modelname = "UNKNOWN";
@@ -216,14 +223,17 @@ void CaptureWorker::start()
         {
             auto* img = dev_->GetImage(200);
             if(!img) continue;
+            /*
             if(!isToF_)
             {
-                emit frameReady(camIdx,toQImage2D(img));
+                emit frameReady(camIdx_,toQImage2D(img));
             }
             else
             {
                 emit errorOccurred("ToF heatmap not implemented (use Helios example logic).");
             }
+            */
+
             onFrameRaw(img);
             //dev_->RequeueBuffer(img);
         }
@@ -245,15 +255,21 @@ CameraWorker::CameraWorker(QWidget *parent)
 {
     ui->setupUi(this);
     //"192.168.1.150";//HTR003S-001     //"192.168.1.151";//TRI032S-CC
-    QString hint = "192.168.1.151";//TRI032S-CC
+    QString hint = "192.168.1.151";
     bool isToF = false;
     int camIdx = -1;
     if(hint == "192.168.1.151")
+    {
         camIdx = 0;
+        isToF = false;
+    }
     else if(hint == "192.168.1.150")
-        camIdx = 1;
+    {
 
-    worker_ = new CaptureWorker(hint,camIdx, isToF);
+        camIdx = 1;
+        isToF = true;
+    }
+    worker_ = new CaptureWorker(hint, isToF, camIdx);
     worker_->moveToThread(&thread_);
     connect(&thread_, &QThread::started, worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, worker_, &CaptureWorker::stop);
@@ -288,39 +304,68 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
 {
     if(img.isNull())return;
     lastFrame_ = img;
-    ui->videoLabel->setPixmap(QPixmap::fromImage(img).scaled(
+    if(camidx == 0)
+    {
+        ui->videoLabel->setPixmap(QPixmap::fromImage(img).scaled(
                                   ui->videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    ui->videoLabel_2->setPixmap(QPixmap::fromImage(img).scaled(
+    }
+    else if(camidx == 1)
+    {
+        ui->videoLabel_2->setPixmap(QPixmap::fromImage(img).scaled(
                                    ui->videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
 }
 
 void CaptureWorker::onFrameRaw(Arena::IImage *img)
 {
     if(!img)
         return;
-
-    QImage qimg, orgimg;
-
-    bool ok = (ImageRenderHelper::makeDepthFalseColor(img,600,2000,qimg));
+    Arena::IImage* copy = nullptr;
+    try
     {
-        //cout<<"test"<<endl;
+        copy = Arena::ImageFactory::Copy(img);
     }
+    catch(...)
+    {
 
-    //bool okOR = ImageRenderHelper::makeIntensityGray(img,0,0,orgimg);
-
-
+    }
     if(dev_) dev_->RequeueBuffer(img);
+    img = nullptr; // 안전
 
-    static QImage lastOk;
-    if (ok && !qimg.isNull())
-    {
-        lastOk = qimg;
-        emit frameReady(camIdx,qimg);
-    }
-    else if (!lastOk.isNull())
-    {
-        emit frameReady(camIdx,lastOk);   // 실패 프레임은 화면 유지
-    }
+    QImage qimg;
+        bool ok = false;
+
+        if (copy) {
+            if (!isToF_) {
+                // RGB 경로
+                qimg = toQImage2D(copy);
+                ok = !qimg.isNull();
+            } else {
+                // ToF 경로 (깊이 false-color)
+                ok = ImageRenderHelper::makeDepthFalseColor(copy, /*min=*/500, /*max=*/1500, qimg);
+                // 필요 시: invalid(0) → 검정 처리, 범위 밖 → 0 처리 등 내부에서 보정
+            }
+        }
+
+        // 4) 복사본 해제
+        if (copy) {
+            try { Arena::ImageFactory::Destroy(copy); }
+            catch (...) {}
+            copy = nullptr;
+        }
+
+        // 5) 마지막 성공 프레임 캐시 & emit
+        //  - static thread_local 로 워커(스레드)별 캐시
+        static thread_local QImage lastOk;
+
+        if (ok && !qimg.isNull()) {
+            lastOk = qimg;
+            emit frameReady(camIdx_, qimg);
+        } else if (!lastOk.isNull()) {
+            // 실패시에는 직전 프레임 유지(필요 없으면 이 가지 삭제 가능)
+            emit frameReady(camIdx_, lastOk);
+        }
+
 }
 
 void CameraWorker::onSnapshot()
