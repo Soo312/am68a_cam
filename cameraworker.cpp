@@ -61,46 +61,147 @@ void CaptureWorker::closeDevice()
     if (sys_) { try { Arena::CloseSystem(sys_); } catch (...) {} sys_ = nullptr; }
 }
 
-QImage CaptureWorker::toQImage2D(Arena::IImage *pImg)
+static inline QImage TightCopyToQImage_StrideAware(Arena::IImage* img)
 {
-    const int w = (int)pImg->GetWidth();
-    const int h = (int)pImg->GetHeight();
-
-    // 현재 포맷이 Mono8이면 바로 사용
+    if (!img)
     {
-        GenApi::CEnumerationPtr pixFmt = dev_->GetNodeMap()->GetNode("PixelFormat");
-        GenApi::CEnumEntryPtr eMono8 = pixFmt ? pixFmt->GetEntryByName("Mono8") : nullptr;
-        if (eMono8 && (uint64_t)eMono8->GetValue() == pImg->GetPixelFormat()) {
-            QImage q((const uchar*)pImg->GetData(), w, h, QImage::Format_Grayscale8);
-            return q.copy();
-        }
-    }
-
-    // 그 외 포맷은 BGR8로 변환 (BGR8의 정수값을 Enum에서 취득)
-    uint64_t bgr8Val = 0;
-    {
-        GenApi::CEnumerationPtr pixFmt = dev_->GetNodeMap()->GetNode("PixelFormat");
-        GenApi::CEnumEntryPtr eBgr8 = pixFmt ? pixFmt->GetEntryByName("BGR8") : nullptr;
-        if (!eBgr8) {
-            qWarning("PixelFormat entry 'BGR8' not available");
-            return QImage();
-        }
-        bgr8Val = (uint64_t)eBgr8->GetValue();
-    }
-
-    Arena::IImage* pBgr = nullptr;
-    try {
-        pBgr = Arena::ImageFactory::Convert(pImg, bgr8Val);
-    } catch (...) {
-        qWarning("ImageFactory::Convert to BGR8 failed");
         return QImage();
     }
 
-    // QImage는 RGB888, 데이터는 BGR → rgbSwapped()
-    QImage q((const uchar*)pBgr->GetData(), w, h, QImage::Format_RGB888);
-    QImage rgb = q.rgbSwapped().copy(); // deep copy (버퍼 회수 대비)
-    Arena::ImageFactory::Destroy(pBgr);
-    return rgb;
+    const int w    = static_cast<int>(img->GetWidth());
+    const int h    = static_cast<int>(img->GetHeight());
+    const int bpp  = static_cast<int>(img->GetBitsPerPixel()); // bits per pixel
+    const int bypp = (bpp + 7) / 8;                            // bytes per pixel
+    const uchar* src = reinterpret_cast<const uchar*>(img->GetData());
+    const size_t filled = img->GetSizeFilled();
+
+    // 소스의 실제 한 줄 길이(패딩 포함)
+    const int srcStride =
+        (h > 0 && (filled % static_cast<size_t>(h)) == 0)
+        ? static_cast<int>(filled / static_cast<size_t>(h))
+        : (w * bypp);
+
+    QImage::Format fmt =
+        (bypp == 1) ? QImage::Format_Grayscale8 :
+        (bypp == 3) ? QImage::Format_BGR888 :
+        (bypp == 4) ? QImage::Format_ARGB32 :
+                      QImage::Format_Invalid;
+
+    if (fmt == QImage::Format_Invalid)
+    {
+        return QImage();
+    }
+
+    QImage out(w, h, fmt);
+    if (out.isNull())
+    {
+        return QImage();
+    }
+
+    // 행마다 소스는 srcStride씩 건너뛰고, 픽셀 유효분(w*bypp)만 복사
+    const size_t copyBytes = static_cast<size_t>(w) * static_cast<size_t>(bypp);
+    for (int y = 0; y < h; ++y)
+    {
+        const uchar* srcLine = src + static_cast<size_t>(y) * static_cast<size_t>(srcStride);
+        uchar* dstLine = out.scanLine(y);
+        memcpy(dstLine, srcLine, copyBytes);
+    }
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+    if (bypp == 3)
+    {
+        // 소스가 BGR인데 Qt<5.14는 RGB888 → 스왑 필요
+        out = out.rgbSwapped();
+    }
+#endif
+
+    return out;
+}
+
+static inline int CalcStepBytes(Arena::IImage* img)
+{
+    const int w   = static_cast<int>(img->GetWidth());
+    const int h   = static_cast<int>(img->GetHeight());
+    const int bpp = static_cast<int>(img->GetBitsPerPixel()); // bits per pixel
+    const int bypp = (bpp + 7) / 8; // ceil to bytes
+
+    const size_t filled = img->GetSizeFilled(); // SDK가 채운 전체 바이트
+    if (h > 0 && (filled % static_cast<size_t>(h)) == 0)
+    {
+        return static_cast<int>(filled / static_cast<size_t>(h)); // 실제 bytesPerLine
+    }
+    return w * bypp; // fallback
+}
+
+QImage CaptureWorker::toQImage2D(Arena::IImage *pImg)
+{
+    if (!pImg)
+    {
+        return QImage();
+    }
+
+    // 1) 우선 현재 버퍼를 stride-aware로 복사 (패딩 고려)
+    QImage out = TightCopyToQImage_StrideAware(pImg);
+    if (!out.isNull())
+    {
+        return out;
+    }
+
+    // 2) (옵션) 그래도 깨지면 32bpp(BGRA8)로 변환해서 다시 복사
+    //    4바이트 정렬이라 훨씬 안정적
+    Arena::IImage* conv = nullptr;
+    try
+    {
+        auto nodeMap = dev_ ? dev_->GetNodeMap() : nullptr;
+        uint64_t bgraVal = 0;
+
+        if (nodeMap)
+        {
+            auto pf = GenApi::CEnumerationPtr(nodeMap->GetNode("PixelFormat"));
+            if (pf)
+            {
+                // 이름은 기기마다 다를 수 있어 "BGRa8", "BGRA8Packed" 둘 다 시도
+                if (auto e = pf->GetEntryByName("BGRa8"); e && GenApi::IsAvailable(e) && GenApi::IsReadable(e))
+                {
+                    bgraVal = static_cast<uint64_t>(e->GetValue());
+                }
+                else if (auto e2 = pf->GetEntryByName("BGRA8Packed"); e2 && GenApi::IsAvailable(e2) && GenApi::IsReadable(e2))
+                {
+                    bgraVal = static_cast<uint64_t>(e2->GetValue());
+                }
+            }
+        }
+
+        if (bgraVal == 0)
+        {
+            // 값 심볼 못 찾으면 표준 상수로도 시도 (없어도 예외 안 나게 try/catch)
+            // Lucid에서는 Convert에 PFNC코드 사용 가능. 필요 시 유지/제거.
+            // bgraVal = ARENA_PFNC_BGRa8; // (환경에 맞게 상수 정의 되어있다면)
+        }
+
+        if (bgraVal != 0)
+        {
+            conv = Arena::ImageFactory::Convert(pImg, bgraVal);
+            QImage out2 = TightCopyToQImage_StrideAware(conv);
+            Arena::ImageFactory::Destroy(conv);
+            conv = nullptr;
+
+            if (!out2.isNull())
+            {
+                return out2;
+            }
+        }
+    }
+    catch (...)
+    {
+        if (conv)
+        {
+            try { Arena::ImageFactory::Destroy(conv); } catch (...) {}
+            conv = nullptr;
+        }
+    }
+
+    return QImage();
 }
 
 
@@ -129,24 +230,25 @@ void CaptureWorker::start()
 
     // 2) 스트림 계층: 자동 MTU 협상 끄기
     if (auto n = GenApi::CBooleanPtr(sMap->GetNode("StreamAutoNegotiatePacketSize")); GenApi::IsWritable(n))
-        n->SetValue(false);
+        n->SetValue(true);
 
     // 3) 장치 측 패킷 크기 “작게” 고정 (MTU=1500 환경에서도 100% 붙는 값부터 시도)
-    if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPSPacketSize")); GenApi::IsWritable(n))
-        n->SetValue(1400);
+    //if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPSPacketSize")); GenApi::IsWritable(n))
+    //    n->SetValue(1400);
     // 1440이 일반 안전값이지만, 스위치/보드 조합에 따라 1400이 더 확실할 때가 많다.
     // 그래도 안 되면 1300 → 1200 → 1000 순으로 내려가며 시도.
 
     // 4) 인터패킷 딜레이로 혼잡 완화 (필요 시 값 ↑)
     if (auto n = GenApi::CIntegerPtr(dMap->GetNode("GevSCPD")); GenApi::IsWritable(n))
-        n->SetValue(5000);
+        n->SetValue(200);
     // 여전히 타임아웃이면 10000, 20000까지도 올려볼 수 있음 (나노초 단위인 경우 多).
 
     // 5) 패킷 재전송 켜기 (유실 대비)
     if (auto n = GenApi::CBooleanPtr(sMap->GetNode("StreamPacketResendEnable")); GenApi::IsWritable(n)) n->SetValue(true);
 
     // 6) 버퍼 처리 모드 (프레임 드롭 시 최신 프레임 유지)
-    if (auto n = GenApi::CEnumerationPtr(sMap->GetNode("StreamBufferHandlingMode")); GenApi::IsWritable(n)) n->FromString("NewestOnly");
+    if (auto n = GenApi::CEnumerationPtr(sMap->GetNode("StreamBufferHandlingMode")); GenApi::IsWritable(n))
+        n->FromString("NewestOnly");
 
     // 7) (강력 권장) 링크 스루풋 제한으로 초반 폭주 방지
     //    모드가 있으면 켜고 적당한 bps로 제한 (예: 80 Mbps)
@@ -158,6 +260,51 @@ void CaptureWorker::start()
         int64_t lo = v->GetMin();
         v->SetValue(std::max<int64_t>(hi,lo));
     }
+
+    try
+    {
+        if (auto en = GenApi::CBooleanPtr(sMap->GetNode("StreamBufferCountManual"));
+            en && GenApi::IsWritable(en))
+        {
+            en->SetValue(true);
+        }
+
+        if (auto cnt = GenApi::CIntegerPtr(sMap->GetNode("StreamBufferCount"));
+            cnt && GenApi::IsWritable(cnt))
+        {
+            int64_t lo = cnt->GetMin();
+            int64_t hi = cnt->GetMax();
+            int64_t want = 32; // 32~64 사이에서 테스트
+            if (want < lo) want = lo;
+            if (want > hi) want = hi;
+            cnt->SetValue(want);
+        }
+    }
+    catch (...) {}
+
+    try
+    {
+        if (auto n = GenApi::CBooleanPtr(dMap->GetNode("ChunkModeActive"));
+            n && GenApi::IsWritable(n))
+        {
+            n->SetValue(false);
+        }
+
+        // 혹시 개별 Chunk 항목 켜져 있으면 전부 Off (있을 때만)
+        const char* chunkKeys[] = {
+            "ChunkEnable", "ChunkTimestampEnable", "ChunkFrameIDEnable",
+            "ChunkExposureTimeEnable", "ChunkGainEnable"
+        };
+        for (auto key : chunkKeys)
+        {
+            if (auto c = GenApi::CBooleanPtr(dMap->GetNode(key));
+                c && GenApi::IsWritable(c))
+            {
+                c->SetValue(false);
+            }
+        }
+    }
+    catch (...) {}
 
     //장치 이름 확인
     std::string modelname = "UNKNOWN";
@@ -297,8 +444,12 @@ CameraWorker::~CameraWorker()
 
 void CameraWorker::onStart()
 {
-    thread_.start();
+    if (!thread_.isRunning())
+    {
+        thread_.start();
+    }
 }
+
 
 void CameraWorker::onFrame(int camidx ,const QImage& img)
 {
@@ -307,12 +458,17 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
     if(camidx == 0)
     {
         ui->videoLabel->setPixmap(QPixmap::fromImage(img).scaled(
-                                  ui->videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                                  ui->videoLabel->size(),
+                                      Qt::KeepAspectRatio,
+                                      Qt::FastTransformation));
     }
+
     else if(camidx == 1)
     {
         ui->videoLabel_2->setPixmap(QPixmap::fromImage(img).scaled(
-                                   ui->videoLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                                   ui->videoLabel->size(),
+                                        Qt::KeepAspectRatio,
+                                        Qt::SmoothTransformation));
     }
 }
 
