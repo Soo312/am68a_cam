@@ -20,6 +20,7 @@ class CaptureWorker : public QObject
 public:
     explicit CaptureWorker(QString deviceHint, bool isToF=false,int camIdx = -1, QObject* parent=nullptr);
     ~CaptureWorker();
+    QImage bayerRG8ToRgbQImage(Arena::IImage* pImg);
 public slots:
     void start();
     void stop();
@@ -42,7 +43,9 @@ private:
     std::atomic<bool> running_{false};
     Arena::ISystem* sys_ = nullptr;
     Arena::IDevice* dev_ = nullptr;
-
+    // ▼ 가시광 표시용 더블버퍼
+    QImage visBuf_[2];
+    int    visIdx_ = 0;
 
 public:
     int camIdx_ = -1;

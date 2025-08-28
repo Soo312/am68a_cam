@@ -51,7 +51,7 @@ bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
             const XYZ_I16* row = reinterpret_cast<const XYZ_I16*>(base + y * stepBytes);
             uint16_t* dst = v16.ptr<uint16_t>(y);
 
-            for(int x = 0;x<h;++x)
+            for(int x = 0; x < w ;++x)
             {
                 const auto& p = row[x];
                 dst[x] = isInvalidXYZ(p.x,p.y,p.z) ? 0u : (uint16_t)std::max(0,(int)p.z);
