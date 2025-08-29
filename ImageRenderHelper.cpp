@@ -92,7 +92,7 @@ bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
     v16.convertTo(v8, CV_8U, scale, shift);
 
     cv::Mat bgr;
-    cv::applyColorMap(v8, bgr, cv::COLORMAP_JET);
+    cv::applyColorMap(255 - v8, bgr, cv::COLORMAP_JET);
 
     // 범위 밖은 검정
     cv::Mat oob = (v16 < (uint16_t)zMin) | (v16 > (uint16_t)zMax);

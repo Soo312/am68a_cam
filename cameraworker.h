@@ -48,6 +48,7 @@ private:
     int    visIdx_ = 0;
 
 public:
+    void setSystem(Arena::ISystem* s);
     int camIdx_ = -1;
 
 
@@ -65,9 +66,15 @@ private slots:
 
 private:
   Ui::CameraWorker* ui;
-  QThread thread_;
-  CaptureWorker* worker_ = nullptr;
+  QThread vis_thread_;
+  QThread tof_thread_;
+  //CaptureWorker* worker_ = nullptr;
+  CaptureWorker* tof_worker_ = nullptr;
+  CaptureWorker* vis_worker_ = nullptr;
   QImage lastFrame_;
+
+public:
+  Arena::ISystem* sys_ = nullptr;
 };
 
 #endif // CAMERAWORKER_H

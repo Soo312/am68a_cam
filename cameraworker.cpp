@@ -7,6 +7,7 @@
 #include <QDateTime>
 #include <QPixmap>
 #include <QDebug>
+#include <QTimer>
 
 
 //Arena
@@ -112,8 +113,14 @@ bool CaptureWorker::openDevice()
 {
     try
     {
-        auto* sys = Arena::OpenSystem();
-        sys_ = sys;
+        //auto* sys = Arena::OpenSystem();
+        //sys_ = sys;
+        if(!sys_)
+        {
+            emit errorOccurred("System not set");
+            return false;
+        }
+
         sys_->UpdateDevices(100);
         std::vector<Arena::DeviceInfo> devs = sys_->GetDevices();
         if(devs.empty()) return false;
@@ -148,7 +155,7 @@ bool CaptureWorker::openDevice()
 void CaptureWorker::closeDevice()
 {
     if (dev_) { try { sys_->DestroyDevice(dev_); } catch (...) {} dev_ = nullptr; }
-    if (sys_) { try { Arena::CloseSystem(sys_); } catch (...) {} sys_ = nullptr; }
+    //if (sys_) { try { Arena::CloseSystem(sys_); } catch (...) {} sys_ = nullptr; }
 }
 
 static inline QImage TightCopyToQImage_StrideAware(Arena::IImage* img)
@@ -296,6 +303,11 @@ QImage CaptureWorker::toQImage2D(Arena::IImage *pImg)
     return QImage();
 }
 
+void CaptureWorker::setSystem(Arena::ISystem *s)
+{
+    sys_ = s;
+}
+
 
 void CaptureWorker::start()
 {
@@ -376,27 +388,6 @@ void CaptureWorker::start()
 
     try
     {
-        if (auto en = GenApi::CBooleanPtr(sMap->GetNode("StreamBufferCountManual"));
-            en && GenApi::IsWritable(en))
-        {
-            en->SetValue(true);
-        }
-
-        if (auto cnt = GenApi::CIntegerPtr(sMap->GetNode("StreamBufferCount"));
-            cnt && GenApi::IsWritable(cnt))
-        {
-            int64_t lo = cnt->GetMin();
-            int64_t hi = cnt->GetMax();
-            int64_t want = 10;
-            if (want < lo) want = lo;
-            if (want > hi) want = hi;
-            cnt->SetValue(want);
-        }
-    }
-    catch (...) {}
-
-    try
-    {
         if (auto n = GenApi::CBooleanPtr(dMap->GetNode("ChunkModeActive"));
             n && GenApi::IsWritable(n))
         {
@@ -463,10 +454,9 @@ void CaptureWorker::start()
     if (auto cnt = GenApi::CIntegerPtr(sMap->GetNode("StreamBufferCount"));
         cnt && GenApi::IsWritable(cnt))
     {
-        int64_t want = 16; // 12~16 권장 (불안하면 24)
-        if (want < cnt->GetMin()) want = cnt->GetMin();
-        if (want > cnt->GetMax()) want = cnt->GetMax();
-        cnt->SetValue(want);
+         int64_t want = isToF_ ? 16 : 12;
+         want = std::clamp(want, cnt->GetMin(), cnt->GetMax());
+         cnt->SetValue(want);
     }
 
     // --- Device ---
@@ -641,7 +631,9 @@ CameraWorker::CameraWorker(QWidget *parent)
 
 
     //"192.168.1.150";//HTR003S-001     //"192.168.1.151";//TRI032S-CC
-    QString hint = "192.168.1.151";
+
+    /*
+    QString hint = "192.168.1.150";
     bool isToF = false;
     int camIdx = -1;
     if(hint == "192.168.1.151")
@@ -655,14 +647,31 @@ CameraWorker::CameraWorker(QWidget *parent)
         camIdx = 1;
         isToF = true;
     }
-    worker_ = new CaptureWorker(hint, isToF, camIdx);
-    worker_->moveToThread(&thread_);
-    connect(&thread_, &QThread::started, worker_, &CaptureWorker::start);
-    connect(this, &CameraWorker::destroyed, worker_, &CaptureWorker::stop);
-    connect(worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
-    connect(worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
+    */
+    sys_ = Arena::OpenSystem();
+
+    vis_worker_ = new CaptureWorker("192.168.1.151", /*isToF=*/false, /*camIdx=*/0);
+    tof_worker_  = new CaptureWorker("192.168.1.150", /*isToF=*/true,  /*camIdx=*/1);
+
+    vis_worker_->moveToThread(&vis_thread_);
+    connect(&vis_thread_, &QThread::started, vis_worker_, &CaptureWorker::start);
+    connect(this, &CameraWorker::destroyed, vis_worker_, &CaptureWorker::stop);
+    connect(vis_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
+    connect(vis_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
+
+
+    tof_worker_->moveToThread(&tof_thread_);
+    connect(&tof_thread_, &QThread::started, tof_worker_, &CaptureWorker::start);
+    connect(this, &CameraWorker::destroyed, tof_worker_, &CaptureWorker::stop);
+    connect(tof_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
+    connect(tof_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
+      statusBar()->showMessage(m, 3000);
+    });
+
+    vis_worker_->setSystem(sys_);
+    tof_worker_->setSystem(sys_);
 
     connect(ui->btnStart,   &QPushButton::clicked, this, &CameraWorker::onStart);
     connect(ui->btnSnapshot,&QPushButton::clicked, this, &CameraWorker::onSnapshot);
@@ -673,20 +682,35 @@ CameraWorker::CameraWorker(QWidget *parent)
 
 CameraWorker::~CameraWorker()
 {
-    if (worker_) {
-      worker_->stop();
-      thread_.quit(); thread_.wait();
-      delete worker_;
+    if (tof_worker_)
+    {
+      tof_worker_->stop();
+      tof_thread_.quit();
+      tof_thread_.wait();
+      delete tof_worker_;
     }
+    if (vis_worker_)
+    {
+      vis_worker_->stop();
+      vis_thread_.quit();
+      vis_thread_.wait();
+      delete vis_worker_;
+    }
+
     delete ui;
 }
 
 void CameraWorker::onStart()
 {
-    if (!thread_.isRunning())
-    {
-        thread_.start();
-    }
+
+    if (!tof_thread_.isRunning())
+        tof_thread_.start();
+    QTimer::singleShot(600, this, [this]{
+        if (!vis_thread_.isRunning())
+            vis_thread_.start();
+    });
+   //vis_thread_.start();
+
 }
 
 
@@ -762,7 +786,7 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
      if (ok && !qimg.isNull())
      {
          lastOk = qimg;
-         emit frameReady(camIdx_, qimg.copy());
+         emit frameReady(camIdx_, qimg);
 
          visIdx_ ^= 1;
      }
