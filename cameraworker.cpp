@@ -8,14 +8,256 @@
 #include <QPixmap>
 #include <QDebug>
 #include <QTimer>
+#include <QLayout>
+#include <QtMath>
 
+#include <cstdint>
+#include <QtGlobal>
+#include <QDebug>
+#include <algorithm>
+#include <limits>
 
 //Arena
 #include <Arena/ArenaApi.h>
 #include <GenApi/GenApi.h>
 
 #include <Base/GCException.h>
+
+
 using namespace std;
+
+struct ABCY16Scales
+{
+    double sA = 1.0;
+    double sB = 1.0;
+    double sC = 1.0;
+    double oA = 0.0;
+    double oB = 0.0;
+    double oC = 0.0;
+};
+
+
+static inline bool isInvalid16(uint16_t v)
+{
+    return v == 0x8000;  // Helios 무효 센티넬
+}
+
+
+
+static inline qint16 bswap16(qint16 v)
+{
+    quint16 u = quint16(v);
+    u = (u >> 8) | (u << 8);
+    return qint16(u);
+}
+
+struct LayoutCfg
+{
+    enum Kind { Interleaved, Planar } kind;
+    size_t step;       // interleaved일 때 사용
+    bool   byteswap;   // 엔디안 스왑 여부
+};
+
+static double measure_cost_interleaved(const uint8_t* data, size_t W, size_t H, size_t step, bool byteswap)
+{
+    // A=X, B=Y, C=Z, Y=Intensity 가정
+    // 이웃 (x,x+1), (y,y+1)의 절대차 합으로 "연속성"을 평가
+    // 채널은 Z(C)와 intensity(Y)를 섞어서 봄 (ToF는 두 채널이 대체로 부드러움)
+    const int stride = int(step);
+    double cost = 0.0;
+    const int maxX = int(W) - 1;
+    const int maxY = int(H) - 1;
+
+    for (int y = 0; y < int(H); ++y)
+    {
+        const qint16* row = reinterpret_cast<const qint16*>(data + y * stride);
+        for (int x = 0; x < int(W); ++x)
+        {
+            auto RD = [&](int xi, int yi, int ch)->qint16 {
+                const qint16* r = reinterpret_cast<const qint16*>(data + yi * stride);
+                qint16 v = r[4 * xi + ch];
+                return byteswap ? bswap16(v) : v;
+            };
+
+            // 우/하 이웃과 차이
+            if (x < maxX)
+            {
+                qint16 c0 = RD(x, y, 2); // C=Z
+                qint16 c1 = RD(x+1, y, 2);
+                cost += std::abs(int(c1) - int(c0));
+
+                qint16 iy0 = RD(x, y, 3); // Y=intensity
+                qint16 iy1 = RD(x+1, y, 3);
+                cost += std::abs(int(iy1) - int(iy0)) * 0.5; // 가중치 낮춤
+            }
+            if (y < maxY)
+            {
+                qint16 c0 = RD(x, y, 2);
+                qint16 c1 = RD(x, y+1, 2);
+                cost += std::abs(int(c1) - int(c0));
+
+                qint16 iy0 = RD(x, y, 3);
+                qint16 iy1 = RD(x, y+1, 3);
+                cost += std::abs(int(iy1) - int(iy0)) * 0.5;
+            }
+        }
+    }
+    return cost / double(W * H);
+}
+
+static double measure_cost_planar(const uint8_t* data, size_t W, size_t H, bool byteswap)
+{
+    // 플래너: [A-plane][B-plane][C-plane][Y-plane] 가정
+    const size_t planeBytes = W * H * sizeof(qint16);
+    const qint16* pA = reinterpret_cast<const qint16*>(data + 0 * planeBytes);
+    const qint16* pB = reinterpret_cast<const qint16*>(data + 1 * planeBytes);
+    const qint16* pC = reinterpret_cast<const qint16*>(data + 2 * planeBytes);
+    const qint16* pY = (reinterpret_cast<const qint16*>(data + 3 * planeBytes));
+
+    auto R = [&](const qint16* base, int idx)->qint16 {
+        qint16 v = base[idx];
+        return byteswap ? bswap16(v) : v;
+    };
+
+    double cost = 0.0;
+    const int maxX = int(W) - 1;
+    const int maxY = int(H) - 1;
+
+    for (int y = 0; y < int(H); ++y)
+    {
+        for (int x = 0; x < int(W); ++x)
+        {
+            int idx = y * int(W) + x;
+
+            if (x < maxX)
+            {
+                cost += std::abs(int(R(pC, idx+1)) - int(R(pC, idx))); // Z
+                if (pY) cost += std::abs(int(R(pY, idx+1)) - int(R(pY, idx))) * 0.5;
+            }
+            if (y < maxY)
+            {
+                cost += std::abs(int(R(pC, idx+int(W))) - int(R(pC, idx)));
+                if (pY) cost += std::abs(int(R(pY, idx+int(W))) - int(R(pY, idx))) * 0.5;
+            }
+        }
+    }
+    return cost / double(W * H);
+}
+
+bool parseABCY16(const uint8_t* data,
+                 size_t W, size_t H, size_t sizeFilled,
+                 const ABCY16Scales& sc,
+                 QVector<QVector3D>& outPts,
+                 size_t* outInvalid /*= nullptr*/,
+                 size_t* outStepBytes /*= nullptr*/)
+{
+    outPts.clear();
+    if (!data || !W || !H || !sizeFilled) return false;
+
+    const size_t step_guessA = W * 8;                    // [A,B,C,Y] * 2B
+    const size_t step_guessB = (sizeFilled % H == 0) ? (sizeFilled / H) : step_guessA;
+
+    // 1) 후보 레이아웃 6개 구성: (interleaved step A/B) × (byteswap on/off) + (planar × byteswap on/off)
+    QVector<LayoutCfg> cands;
+    cands.push_back({LayoutCfg::Interleaved, step_guessA, false});
+    cands.push_back({LayoutCfg::Interleaved, step_guessA, true});
+    cands.push_back({LayoutCfg::Interleaved, step_guessB, false});
+    cands.push_back({LayoutCfg::Interleaved, step_guessB, true});
+    // 플래너는 sizeFilled가 충분한 경우만 고려
+    if (sizeFilled >= W*H*int(sizeof(qint16))*3)
+    {
+        cands.push_back({LayoutCfg::Planar, 0, false});
+        cands.push_back({LayoutCfg::Planar, 0, true});
+    }
+
+    // 2) 각 후보의 "연속성" 비용 측정
+    double bestCost = std::numeric_limits<double>::infinity();
+    LayoutCfg best = cands[0];
+
+    for (const auto& c : cands)
+    {
+        double cost = 0.0;
+        if (c.kind == LayoutCfg::Interleaved)
+            cost = measure_cost_interleaved(data, W, H, c.step, c.byteswap);
+        else
+            cost = measure_cost_planar(data, W, H, c.byteswap);
+
+        // qDebug() << "[ABCY16][try]" << (c.kind==LayoutCfg::Interleaved?"ILV":"PLN")
+        //          << "step" << (c.kind==LayoutCfg::Interleaved? (int)c.step : -1)
+        //          << "bswap" << c.byteswap << "cost" << cost;
+
+        if (cost < bestCost)
+        {
+            bestCost = cost;
+            best = c;
+        }
+    }
+
+    // 3) 최적 레이아웃으로 실제 파싱 (A=X, B=Y, C=Z, signed16, -32768 invalid)
+    size_t invalid = 0;
+    outPts.reserve(int(W * H));
+
+    auto pushPoint = [&](qint16 ax, qint16 ay, qint16 az)
+    {
+        if (best.byteswap) { ax = bswap16(ax); ay = bswap16(ay); az = bswap16(az); }
+        if (ax == -32768 || ay == -32768 || az == -32768) { ++invalid; return; }
+
+        float X = float(ax) * sc.sA + sc.oA;
+        float Y = float(ay) * sc.sB + sc.oB;
+        float Z = float(az) * sc.sC + sc.oC;
+
+        // 화면 좌표 보정(원한다면): ToF 이미지계 ↔ 수학계 차이
+        Y = -Y;
+
+        outPts.push_back(QVector3D(X, Y, Z));
+    };
+
+    if (best.kind == LayoutCfg::Interleaved)
+    {
+        const size_t step = best.step;
+        if (outStepBytes) *outStepBytes = step;
+
+        for (size_t y = 0; y < H; ++y)
+        {
+            const qint16* row = reinterpret_cast<const qint16*>(data + y * step);
+            for (size_t x = 0; x < W; ++x)
+            {
+                const qint16 ax = row[4 * x + 0];
+                const qint16 ay = row[4 * x + 1];
+                const qint16 az = row[4 * x + 2];
+                pushPoint(ax, ay, az);
+            }
+        }
+    }
+    else // Planar
+    {
+        const size_t planeBytes = W * H * sizeof(qint16);
+        if (outStepBytes) *outStepBytes = planeBytes; // 의미상
+
+        const qint16* pA = reinterpret_cast<const qint16*>(data + 0 * planeBytes);
+        const qint16* pB = reinterpret_cast<const qint16*>(data + 1 * planeBytes);
+        const qint16* pC = reinterpret_cast<const qint16*>(data + 2 * planeBytes);
+
+        for (size_t i = 0; i < W * H; ++i)
+        {
+            pushPoint(pA[i], pB[i], pC[i]);
+        }
+    }
+
+    if (outInvalid) *outInvalid = invalid;
+
+    //qDebug() << "[ABCY16][best]" << (best.kind==LayoutCfg::Interleaved?"ILV":"PLN")
+    //         << "step" << (best.kind==LayoutCfg::Interleaved? (int)best.step : -1)
+    //         << "bswap" << best.byteswap
+    //         << "cost" << bestCost
+    //         << "outPts" << outPts.size()
+    //         << "invalid" << invalid;
+
+    return !outPts.isEmpty();
+}
+
+
+
 
 CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
     :QObject(p), hint_(std::move(hint)), isToF_(isToF),camIdx_(camIdx){}
@@ -381,9 +623,9 @@ void CaptureWorker::start()
         if (target < min) target = min;
         if (target > max) target = max;
         fr->SetValue(target);
-        qDebug() << "FrameRate set to" << target;
+        //qDebug() << "FrameRate set to" << target;
     } else {
-        qDebug() << "AcquisitionFrameRate not available on this model.";
+        //qDebug() << "AcquisitionFrameRate not available on this model.";
     }
 
     try
@@ -502,15 +744,17 @@ void CaptureWorker::start()
     if(modelname == "HTR003S-001")
     {
         //2D
+        /*
         bool ok = setPF("Coord3D_C16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
-        //3D 인데 프레임끊김이 좀심함
-        /*
-        bool ok = setPF("Coord3D_ABCY16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
-        if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
-        if (!ok) ok = setPF("Coord3D_ABCY16"); // 반복 시도 가능
         */
+        //3D 인데 프레임끊김이 좀심함
+
+        bool ok = setPF("Coord3D_C16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절 이엇는데 C16으로도 된다고 이야기들음
+        if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
+        if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
+
 
         auto w = GenApi::CIntegerPtr(dMap->GetNode("Width"));
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
@@ -534,7 +778,7 @@ void CaptureWorker::start()
         auto width = w->GetValue("Width");
         auto height = h->GetValue("Height");
 
-                qDebug() << "width : "<< width << " , height : " << height <<endl;
+                //qDebug() << "width : "<< width << " , height : " << height <<endl;
     }
 
     try
@@ -625,10 +869,39 @@ CameraWorker::CameraWorker(QWidget *parent)
     ui->videoLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     ui->videoLabel->setAlignment(Qt::AlignCenter);
 
+    /*
     ui->videoLabel_2->setScaledContents(true);
     ui->videoLabel_2->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     ui->videoLabel_2->setAlignment(Qt::AlignCenter);
+    */
 
+    //Tof 자리 videoLabel_2 를 CPUPointCloudView로 교체
+    pcView_ = new CPUPointCloudView(ui->videoLabel_2->parentWidget());
+    if (QLayout* lay = ui->videoLabel_2->parentWidget()->layout())
+    {
+        lay->removeWidget(ui->videoLabel_2);
+        ui->videoLabel_2->hide();
+        ui->videoLabel_2->setParent(nullptr);
+        lay->addWidget(pcView_);
+    }
+    else
+    {
+        pcView_->setGeometry(ui->videoLabel_2->geometry());
+        pcView_->setParent(ui->videoLabel_2->parentWidget());
+        ui->videoLabel_2->hide();
+    }
+
+    pcPollTimer_.setInterval(16);
+    connect(&pcPollTimer_, &QTimer::timeout, this, &CameraWorker::onPcPoll);
+    pcPollTimer_.start();
+
+    //wasd key binding
+    new QShortcut(QKeySequence(Qt::Key_W), this, [this]() { if (pcView_) pcView_->orbitBy(0.0f, +2.0f); });
+    new QShortcut(QKeySequence(Qt::Key_S), this, [this]() { if (pcView_) pcView_->orbitBy(0.0f, -2.0f); });
+    new QShortcut(QKeySequence(Qt::Key_A), this, [this]() { if (pcView_) pcView_->orbitBy(-2.0f, 0.0f); });
+    new QShortcut(QKeySequence(Qt::Key_D), this, [this]() { if (pcView_) pcView_->orbitBy(+2.0f, 0.0f); });
+    new QShortcut(QKeySequence(Qt::Key_Up),   this, [this]() { if (pcView_) pcView_->zoomBy(+0.05f); });
+    new QShortcut(QKeySequence(Qt::Key_Down), this, [this]() { if (pcView_) pcView_->zoomBy(-0.05f); });
 
     //"192.168.1.150";//HTR003S-001     //"192.168.1.151";//TRI032S-CC
 
@@ -665,7 +938,8 @@ CameraWorker::CameraWorker(QWidget *parent)
     tof_worker_->moveToThread(&tof_thread_);
     connect(&tof_thread_, &QThread::started, tof_worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, tof_worker_, &CaptureWorker::stop);
-    connect(tof_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
+    connect(tof_worker_, &CaptureWorker::frameReadyABCY16, this,
+            &CameraWorker::onFrameABCY16, Qt::QueuedConnection);
     connect(tof_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
@@ -700,15 +974,49 @@ CameraWorker::~CameraWorker()
     delete ui;
 }
 
+void CameraWorker::handleTermKey(char ch)
+{
+    switch (ch)
+    {
+        case 'w': case 'W':
+            pcView_->orbitBy(0.0f, -5.0f);
+            break;
+        case 's': case 'S':
+            pcView_->orbitBy(0.0f, +5.0f);
+            break;
+        case 'a': case 'A':
+            pcView_->orbitBy(-5.0f, 0.0f);
+            break;
+        case 'd': case 'D':
+            pcView_->orbitBy(+5.0f, 0.0f);
+            break;
+        case 'q': case 'Q':
+            pcView_->zoomBy(+20.0f);
+            break;
+        case 'e': case 'E':
+            pcView_->zoomBy(-20.0f);
+            break;
+        case 'x': case 'X':
+            QCoreApplication::quit();
+            return;
+        default:
+            return;
+    }
+
+    pcView_->update();
+}
+
 void CameraWorker::onStart()
 {
 
     if (!tof_thread_.isRunning())
         tof_thread_.start();
+    /*
     QTimer::singleShot(600, this, [this]{
         if (!vis_thread_.isRunning())
             vis_thread_.start();
     });
+    */
    //vis_thread_.start();
 
 }
@@ -741,61 +1049,211 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
     }
 }
 
+void CameraWorker::onFrameABCY16(int camidx, QByteArray data, size_t width, size_t height, size_t sizeFilled)
+{
+    Q_UNUSED(camidx);
+
+    if (!pcView_)
+    {
+        //qDebug() << "[ABCY16] pcView_ not set";           // New
+        return;
+    }
+    if (data.isEmpty() || width == 0 || height == 0 || sizeFilled == 0)
+    {
+        //qDebug() << "[ABCY16] invalid frame args";        // New
+        return;
+    }
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.constData());  // <-- 추가
+
+    ABCY16Scales sc; // New: 초기엔 1.0/0.0. 나중에 GenICam 값 반영.
+    QVector<QVector3D> pts;
+    size_t invalid = 0, stepBytes = 0;
+
+    if (!parseABCY16(ptr, width, height, sizeFilled, sc, pts, &invalid, &stepBytes))
+    {
+        //qDebug() << "[ABCY16] parse failed";              // New
+        return;
+    }
+
+    //qDebug() << "[ABCY16] W" << width << "H" << height
+    //       << "pts" << pts.size()
+    //       << "invalid" << invalid
+    //       << "step" << stepBytes;                      // New
+
+    // New: 점군을 뷰로 전달 (UV는 혼선 방지를 위해 사용하지 않음)
+    pcView_->updatePointCloud(pts);
+}
+
+void CameraWorker::onPcPoll()
+{
+    if(!tof_worker_ || !pcView_)
+    {
+        return;
+    }
+
+    const QVector<QVector3D>* pts = nullptr;
+    const QVector<quint16>* conf = nullptr;
+    int w = 0;
+    int h = 0;
+
+    const bool ok = tof_worker_->takeLatestPointCloud(pts, conf, w, h);
+    if (!ok)
+    {
+        // 아직 새 데이터 없음
+        // qDebug() << "[PC Poll] no new";
+        return;
+    }
+
+    const int n = (pts ? pts->size() : 0);
+    //qDebug() << "[PC Poll] got points:" << n << " (" << w << "x" << h << ")";  // ★ 여기 확인
+
+    if (pts && !pts->isEmpty())
+    {
+        pcView_->updatePointCloud(*pts);
+    }
+}
+
+static QImage MakeGrayFromABCY16(const uint8_t* data,
+                                 size_t W, size_t H, size_t sizeFilled)
+{
+    if (!data || !W || !H || !sizeFilled) return QImage();
+
+    const size_t bypp = 2 * 4;                // A,B,C,Y = 4ch × 2B
+    const size_t tight = W * bypp;
+    const size_t step = (H > 0 && (sizeFilled % H) == 0) ? (sizeFilled / H) : tight;
+
+    QImage out(int(W), int(H), QImage::Format_Grayscale16);
+    if (out.isNull()) return QImage();
+
+    for (size_t y = 0; y < H; ++y)
+    {
+        const qint16* row = reinterpret_cast<const qint16*>(data + y * step);
+        quint16* dst = reinterpret_cast<quint16*>(out.scanLine(int(y)));
+
+        for (size_t x = 0; x < W; ++x)
+        {
+            qint16 Iy = row[4 * x + 3];             // Y 채널(16s)
+            // 무효값(-32768) → 0으로
+            int v = (Iy == qint16(-32768)) ? 0 : qMax(0, int(Iy));
+            dst[x] = quint16(v);
+        }
+    }
+    return out;
+}
+
+static BackProjLUT s_lut;
+static bool s_lut_ready = false;
+
 void CaptureWorker::onFrameRaw(Arena::IImage *img)
 {
     if (!img)
-         return;
+        return;
 
-     // 1) 복사
-     Arena::IImage* copy = nullptr;
-     try { copy = Arena::ImageFactory::Copy(img); } catch (...) {}
+    // 1) 안전 복사
+    Arena::IImage* copy = nullptr;
+    try { copy = Arena::ImageFactory::Copy(img); } catch (...) {}
 
-     // 2) 원본 즉시 반납
-     if (dev_) dev_->RequeueBuffer(img);
-     img = nullptr;
+    // 2) 원본 즉시 반납 (이후 절대 참조 금지)
+    if (dev_) dev_->RequeueBuffer(img);
+    img = nullptr;
 
-     // 3) 변환
-     QImage qimg;
-     bool ok = false;
+    // 3) 변환
+    QImage qimg;     // (옵션) 2D 히트맵 표시용
+    bool ok = false; // 2D 프리뷰 성공 여부
 
-     if (copy)
-     {
-         if (!isToF_)
-         {
-             // 가시광: BayerRG8로 수신 후 컬러화
-             qimg = bayerRG8ToRgbQImage(copy);
-             if (qimg.isNull())
-             {
-                 // 혹시 현재가 이미 RGB/BGR8인 경우 등: 기존 타이트 카피로 폴백
-                 qimg = TightCopyToQImage_StrideAware(copy);
-             }
-             ok = !qimg.isNull();
-         }
-         else
-         {
-             // ToF: 기존 false color
-             ok = ImageRenderHelper::makeDepthFalseColor(copy, 300, 6000, qimg);
-         }
+    if (copy)
+    {
+        if (!isToF_)  // 가시광 카메라 (기존 경로 유지)
+        {
+            qimg = bayerRG8ToRgbQImage(copy);
+            if (qimg.isNull())
+            {
+                // 이미 RGB/BGR8 등인 경우 타이트 카피로 폴백
+                qimg = TightCopyToQImage_StrideAware(copy);
+            }
+            ok = !qimg.isNull();
+        }
+        else          // ToF 카메라 (C16 → 역투영 → 포인트클라우드)
+        {
+            const int w   = static_cast<int>(copy->GetWidth());
+            const int h   = static_cast<int>(copy->GetHeight());
+            const int bpp = static_cast<int>(copy->GetBitsPerPixel());
 
-         try { Arena::ImageFactory::Destroy(copy); } catch (...) {}
-         copy = nullptr;
-     }
+            if (w > 0 && h > 0 && bpp == 16)
+            {
+                // --- LUT 준비(해상도/내참수 바뀌면 재생성) ---
+                static BackProjLUT s_lut;
+                static bool s_lut_ready = false;
+                if (!s_lut_ready || s_lut.w != w || s_lut.h != h)
+                {
+                    // TODO: 실제 캘리브레이션 값으로 교체하세요.
+                    const float cx = w * 0.5f, cy = h * 0.5f;
+                    const float fx = 580.0f,   fy = 580.0f;
+                    s_lut_ready = BuildBackProjLUT(w, h, fx, fy, cx, cy, s_lut);
+                }
 
-     // 4) emit
-     static thread_local QImage lastOk;
-     if (ok && !qimg.isNull())
-     {
-         lastOk = qimg;
-         emit frameReady(camIdx_, qimg);
+                // --- C16 → XYZ 포인트클라우드 ---
+                QVector<QVector3D>& workPts = pcBuf_[pcIdx_];
+                QVector<quint16>&   workCnf = confBuf_[pcIdx_]; // 현재는 미사용
+                workPts.clear();
+                workCnf.clear();
 
-         visIdx_ ^= 1;
-     }
-     /*
-     else if (!lastOk.isNull())
-     {
-         emit frameReady(camIdx_, lastOk);
-     }
-     */
+                const uint16_t zInvalid = 0x8000; // Helios 무효값
+                const uint16_t zMin     = 300;    // (옵션) 0.3m 미만 제거
+                const uint16_t zMax     = 6000;   // (옵션) 6m 초과 제거
+                const float    zScale   = 0.001f; // mm → m
+
+                if (s_lut_ready &&
+                    extractPointCloudC16(copy, s_lut, zScale,
+                                                           zInvalid, zMin, zMax,
+                                                           workPts, &lastW_, &lastH_))
+                {
+                    // 더블버퍼 토글 + 새 데이터 플래그
+                    pcIdx_ ^= 1;
+                    pcHasNew_ = true;  // onPcPoll()에서 읽음
+
+                    // (옵션) 2D 히트맵도 만들기 — UI에서 보고 싶을 때
+                    ImageRenderHelper::makeDepthFalseColor(copy, /*zMin=*/0, /*zMax=*/0, qimg);
+                    ok = !qimg.isNull();
+                }
+            }
+            else
+            {
+                // C16이 아니면 (장치 포맷 설정 확인 필요)
+                ok = false;
+            }
+        }
+
+        try { Arena::ImageFactory::Destroy(copy); } catch (...) {}
+        copy = nullptr;
+    }
+
+    // 4) (옵션) 2D 프리뷰 emit — ToF도 라벨에 컬러맵을 띄우고 싶다면 사용
+    static thread_local QImage lastOk;
+    if (ok && !qimg.isNull())
+    {
+        lastOk = qimg;
+        emit frameReady(camIdx_, qimg);   // CameraWorker::onFrame(...) 연결되어 있으면 보임
+        visIdx_ ^= 1;
+    }
+    // else: 프리뷰 없으면 emit 생략 (포인트클라우드는 onPcPoll()에서 갱신)
+}
+
+bool CaptureWorker::takeLatestPointCloud(const QVector<QVector3D> *&outPts, const QVector<quint16> *&outConf, int &outW, int &outH)
+{
+    if(!pcHasNew_.exchange((false)))
+    {
+        return false;
+    }
+
+    const int readIdx = pcIdx_ ^1;
+    outPts = &pcBuf_[readIdx];
+    outConf = &confBuf_[readIdx];
+    outW = lastW_;
+    outH = lastH_;
+
+    return true;
 }
 
 void CameraWorker::onSnapshot()

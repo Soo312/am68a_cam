@@ -6,10 +6,14 @@ TARGET = CameraWorker
 
 SOURCES += main.cpp \
            ImageRenderHelper.cpp \
-           cameraworker.cpp
+           TerminalInput.cpp \
+           cameraworker.cpp \
+           cpu_pointcloud_view.cpp
 
 HEADERS += cameraworker.h \
-           ImageRenderHelper.h
+           ImageRenderHelper.h \
+           TerminalInput.h \
+           cpu_pointcloud_view.h
 
 FORMS   += cameraworker.ui
 

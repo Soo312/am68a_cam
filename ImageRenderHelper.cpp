@@ -2,9 +2,13 @@
 
 
 
+#include <QDebug>
+
+
 // 행 스텝(바이트) 계산 도우미
 // 1) 우선 width * bpp 로 계산
 // 2) 만약 sizeFilled가 높이로 딱 나눠떨어지면 그 값을 우선 사용(패딩이 있을 경우 대비)
+
 
 size_t ImageRenderHelper::calcStepBytes(Arena::IImage* img)
 {
@@ -22,6 +26,79 @@ size_t ImageRenderHelper::calcStepBytes(Arena::IImage* img)
     }
     return step;
 }
+bool ImageRenderHelper::extractPointCloudABCY16(
+    Arena::IImage* img,
+    float scale,
+    int   stride,
+    quint16 confMin,
+    QVector<QVector3D>& outPts,
+    QVector<quint16>*   outConf,
+    int* outW,
+    int* outH
+)
+{
+    if(!img) return false;
+
+    const int w = static_cast<int>(img->GetWidth());
+    const int h = static_cast<int>(img->GetHeight());
+    const int bpp = static_cast<int>(img->GetBitsPerPixel());
+
+    if(w <= 0 || h <= 0 || bpp != 64)
+    {
+        return false;
+    }
+
+    const auto* base = static_cast<const uchar*>(img->GetData());
+    if(!base) return false;
+
+    //stide rPtks
+    const size_t stepBytes = calcStepBytes(img);
+
+    outPts.clear();
+    if(outConf) outConf->clear();
+
+    const int sx = std::max(1,stride);
+    const int sy = std::max(1,stride);
+
+    //다운샘플반영
+    const int resW = (w + sx - 1 )/ sx;
+    const int resH = (h + sy - 1) / sy;
+    outPts.reserve(resW * resH);
+    if (outConf) outConf->reserve(resW * resH);
+
+    // ABCY16: (x,y,z,c) = 16-bit signed * 3 + 16-bit (confidence/intensity)
+    for (int y = 0; y < h; y += sy) {
+        const auto* row = reinterpret_cast<const XYZC_I16*>(base + static_cast<size_t>(y) * stepBytes);
+        for (int x = 0; x < w; x += sx) {
+            const XYZC_I16 p = row[x];
+
+            // 무효 포인트/신뢰도 필터
+            if (isInvalidXYZ(p.x, p.y, p.z)) continue;
+            if (p.z <= 0) continue; // 음수/0 깊이 제거(장치 스펙에 맞게 조정 가능)
+            if (confMin > 0 && static_cast<quint16>(p.c) < confMin) continue;
+
+            // 스케일 적용 (ex: mm → m이면 scale = 0.001f)
+            outPts.push_back(QVector3D(
+                static_cast<float>(p.x) * scale,
+                static_cast<float>(p.y) * scale,
+                static_cast<float>(p.z) * scale
+            ));
+            if (outConf) outConf->push_back(static_cast<quint16>(p.c));
+        }
+    }
+
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+
+    qDebug() << "[extractPointCloudABCY16] w:" << w
+             << " h:" << h
+             << " bpp:" << bpp
+             << " outPts:" << outPts.size();    // ★ 이 숫자 체크
+
+    return !outPts.isEmpty();
+
+}
+
 
 
 bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
@@ -101,4 +178,106 @@ bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
     outBGR = QImage(bgr.data, bgr.cols, bgr.rows, bgr.step, QImage::Format_BGR888).copy();
     return !outBGR.isNull();
 
+}
+
+bool BuildBackProjLUT(int w, int h, float fx, float fy, float cx, float cy, BackProjLUT &lut)
+{
+    if (w <= 0 || h <= 0 || fx == 0.0f || fy == 0.0f)
+    {
+         qInfo() << "[ToF] Build LUT" << w << "x" << h;
+        return false;
+    }
+
+    lut.w = w;
+    lut.h = h;
+    lut.ray.resize(w * h);
+
+    for(int y = 0; y < h; ++y)
+    {
+        for(int x = 0; x< w; ++x)
+        {
+            const float rx = (float(x) - cx ) /fx;
+            const float ry = (float(y) - cy ) / fy;
+            lut.ray[y * w + x] = QVector2D(rx,ry);
+
+        }
+    }
+}
+
+bool extractPointCloudC16(Arena::IImage* img,
+                          const BackProjLUT& lut,
+                          float zScale,
+                          uint16_t zInvalid,
+                          uint16_t zMinValid,
+                          uint16_t zMaxValid,
+                          QVector<QVector3D>& outPts,
+                          int* outW,
+                          int* outH)
+{
+    if (!img)
+    {
+        return false;
+    }
+
+    const int w   = (int)img->GetWidth();
+    const int h   = (int)img->GetHeight();
+    const int bpp = (int)img->GetBitsPerPixel();
+
+    if (w <= 0 || h <= 0 || bpp != 16)
+    {
+        return false; // C16 전용
+    }
+
+    if (lut.w != w || lut.h != h || lut.ray.size() != w * h)
+    {
+        return false; // LUT 크기 불일치
+    }
+
+    const uint8_t* base = static_cast<const uint8_t*>(img->GetData());
+    if (!base)
+    {
+        return false;
+    }
+
+    const size_t stepBytes = ImageRenderHelper::calcStepBytes(img); // 이미 존재하는 함수 사용
+    // stride 준수: 행 시작 = base + y * stepBytes  :contentReference[oaicite:5]{index=5}
+
+    outPts.clear();
+    outPts.reserve(w * h / 2); // 대충 절반 잡기 (필요 시 조정)
+
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(base + y * stepBytes);
+        for (int x = 0; x < w; ++x)
+        {
+            const uint16_t Zraw = row[x];
+
+            if (Zraw == zInvalid)
+            {
+                continue;
+            }
+            if (zMinValid && Zraw < zMinValid)
+            {
+                continue;
+            }
+            if (zMaxValid && Zraw > zMaxValid)
+            {
+                continue;
+            }
+
+            const QVector2D r = lut.ray[y * w + x]; // ((u-cx)/fx, (v-cy)/fy)
+
+            const float Z = float(Zraw) * zScale;
+            const float X = r.x() * Z;
+            const float Y = r.y() * Z;
+
+            // (시각계 상하 뒤집기 원하면 Y = -Y)
+            outPts.push_back(QVector3D(X, -Y, Z));
+        }
+    }
+
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+
+    return !outPts.isEmpty();
 }

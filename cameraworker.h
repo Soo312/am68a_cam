@@ -7,6 +7,16 @@
 #include <QThread>
 #include <atomic>
 #include <QImage>
+#include <QVector3D>
+#include <QMutex>
+#include <QMutexLocker>
+#include <vector>
+
+
+
+//3D 출력
+#include "cpu_pointcloud_view.h"
+#include  <QShortcut>
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class CameraWorker; }
@@ -29,9 +39,23 @@ signals:
     //void frameReady(const QImage& img, const QImage& img2);
     void frameReady(int camidx,QImage img);
     void errorOccurred(const QString& msg);
+    void pointCloudReady(int camidx, std::vector<QVector3D>& point);
+    void frameReadyABCY16(int camidx,
+                          QByteArray raw,
+                          size_t width,
+                          size_t height,
+                          size_t sizeFilled,
+                          size_t strideBytes);
 
-public slots:
+public :
     void onFrameRaw(Arena::IImage* img);
+    bool takeLatestPointCloud
+    (
+        const QVector<QVector3D>*& outPts,
+        const QVector<quint16>*&   outConf,
+        int& outW,
+        int& outH
+    );
 
 private:
     bool openDevice();
@@ -47,10 +71,20 @@ private:
     QImage visBuf_[2];
     int    visIdx_ = 0;
 
+
+
 public:
     void setSystem(Arena::ISystem* s);
     int camIdx_ = -1;
 
+    // 포인트클라우드 더블버퍼 (ToF 전용)
+private:
+    QVector<QVector3D> pcBuf_[2];
+    QVector<quint16>   confBuf_[2];
+    int                pcIdx_ = 0;          // write index
+    std::atomic<bool>  pcHasNew_{ false };
+    int                lastW_ = 0;
+    int                lastH_ = 0;
 
 };
 
@@ -59,10 +93,24 @@ class CameraWorker : public QMainWindow {
 public:
   explicit CameraWorker(QWidget* parent=nullptr);
   ~CameraWorker();
+public slots:
+    void handleTermKey(char ch);
+
 private slots:
   void onStart();
   void onSnapshot();
-  void onFrame(int camidx, const QImage& img);
+  void onFrame(int camidx, const QImage& img);//2D용
+
+  void onFrameABCY16(int camidx,
+                     QByteArray data,
+                     size_t width,
+                     size_t height,
+                     size_t sizeFilled);
+
+  void setPointCloudView(CPUPointCloudView* view){pcView_ = view;}
+
+  //Tof 타이머 슬롯
+  void onPcPoll();
 
 private:
   Ui::CameraWorker* ui;
@@ -72,6 +120,9 @@ private:
   CaptureWorker* tof_worker_ = nullptr;
   CaptureWorker* vis_worker_ = nullptr;
   QImage lastFrame_;
+
+  CPUPointCloudView* pcView_ = nullptr;
+  QTimer pcPollTimer_;
 
 public:
   Arena::ISystem* sys_ = nullptr;
