@@ -93,6 +93,11 @@ class CameraWorker : public QMainWindow {
 public:
   explicit CameraWorker(QWidget* parent=nullptr);
   ~CameraWorker();
+    CPUPointCloudView* pcView() const  // ✅ public getter
+    {
+        return pcView_;
+    }
+
 public slots:
     void handleTermKey(char ch);
 

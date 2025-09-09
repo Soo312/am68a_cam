@@ -180,6 +180,9 @@ void CPUPointCloudView::drawPoints()
         float minY =  std::numeric_limits<float>::infinity();
         float maxY = -std::numeric_limits<float>::infinity();
 
+        float minZ = +std::numeric_limits<float>::infinity();
+        float maxZ = -std::numeric_limits<float>::infinity();
+
         for (int i = 0; i < n; ++i)
         {
             const QVector3D& p = rot * pts[i];
@@ -191,7 +194,12 @@ void CPUPointCloudView::drawPoints()
             if (p.x() > maxX) maxX = p.x();
             if (p.y() < minY) minY = p.y();
             if (p.y() > maxY) maxY = p.y();
+
+            if (p.z() < minZ) minZ = p.z();
+            if (p.z() > maxZ) maxZ = p.z();
         }
+
+        if (rpts.isEmpty()) return;
 
         if (!(minX < maxX) || !(minY < maxY))
         {
@@ -199,28 +207,63 @@ void CPUPointCloudView::drawPoints()
             return;
         }
 
+        float zLo = useFixedZ_ ? zMin_ : minZ;
+        float zHi = useFixedZ_ ? zMax_ : maxZ;
+        if (!(zLo < zHi))
+        { zLo = minZ; zHi = maxZ; }
+
+        auto colorFromZ = [&](float z) -> QRgb
+        {
+            if (!std::isfinite(z))
+                return qRgb(255,255,255);
+            float denom = (zHi - zLo);
+            if (!(denom > 0.f) || !std::isfinite(denom))
+                return qRgb(255,255,255);
+            float t = (z - zLo) / (denom);
+            if (!std::isfinite(t))
+                t = 0.f;
+
+            t = std::clamp(t, 0.0f, 1.0f);
+            const qreal hueDeg = 240.0 * (1.0 - t);
+            QColor c; c.setHsvF(hueDeg/360.0, 1.0, 1.0);
+            return c.rgb();
+        };
+
         const float rangeX = maxX - minX;
         const float rangeY = maxY - minY;
         const float midX   = 0.5f * (minX + maxX);
         const float midY   = 0.5f * (minY + maxY);
 
         // 화면을 95% 채우도록 동일비율 스케일
-        const float scaleX = 0.95f * W / rangeX;
-        const float scaleY = 0.95f * H / rangeY;
+        const float scaleX = 0.95f * W / (rangeX > 0 ? rangeX : 1e-6f);
+        const float scaleY = 0.95f * H / (rangeY > 0 ? rangeY : 1e-6f);
         const float S      = std::min(scaleX, scaleY);
 
         uchar* base   = fb_.bits();
         const int stride = fb_.bytesPerLine();
-        auto putPixel = [&](int x, int y)
+        //auto putPixel = [&](int x, int y)
+        //{
+        //    if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H)
+        //    {
+        //        reinterpret_cast<QRgb*>(base + y * stride)[x] = qRgb(255, 220, 40);
+        //    }
+        //};
+
+        static std::vector<float> zbuf;
+        zbuf.assign((size_t)W * (size_t)H, std::numeric_limits<float>::infinity());
+
+        auto putPixelZ = [&](int x, int y, float z, QRgb col)
         {
-            if ((unsigned)x < (unsigned)W && (unsigned)y < (unsigned)H)
-            {
-                reinterpret_cast<QRgb*>(base + y * stride)[x] = qRgb(255, 220, 40);
+            if ((unsigned)x >= (unsigned)W || (unsigned)y >= (unsigned)H) return;
+            size_t idx = (size_t)y * (size_t)W + (size_t)x;
+            if (z < zbuf[idx]) {
+                zbuf[idx] = z;
+                reinterpret_cast<QRgb*>(base + y * stride)[x] = col;
             }
         };
 
         int plotted = 0;
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < rpts.size(); ++i)
         {
             const QVector3D& p = rpts[i];
 
@@ -231,11 +274,14 @@ void CPUPointCloudView::drawPoints()
             const int ix = (int)std::lround(sx);
             const int iy = (int)std::lround(sy);
 
-            if ((unsigned)ix < (unsigned)W && (unsigned)iy < (unsigned)H)
-            {
-                putPixel(ix, iy);
-                ++plotted;
-            }
+            //if ((unsigned)ix < (unsigned)W && (unsigned)iy < (unsigned)H)
+            //{
+            //    putPixel(ix, iy);
+            //    ++plotted;
+            //}
+
+            const QRgb col = colorFromZ(p.z());      // ***
+            putPixelZ(ix, iy, p.z(), col);           // ***
         }
 
         //qDebug() << "[FLAT] plotted:" << plotted

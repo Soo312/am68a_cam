@@ -9,8 +9,11 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
     CameraWorker w;
+    w.pcView()->setZRange(0.3f,6.0f,true);
+
     w.resize(960, 600);
     w.show();
+
 
     //터미널 입력
     auto* term = new TerminalInput(&w);

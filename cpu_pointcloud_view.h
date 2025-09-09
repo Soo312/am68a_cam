@@ -24,6 +24,11 @@ public:
     void orbitBy(float dYawDeg, float dPitchDeg);
     void zoomBy(float delta);
 
+    void setZRange(float zmin_m, float zmax_m, bool useFixed)
+    {
+         zMin_ = zmin_m; zMax_ = zmax_m; useFixedZ_ = useFixed;
+    }
+
 protected:
     void paintEvent(QPaintEvent*) override;
     void resizeEvent(QResizeEvent*) override;
@@ -39,6 +44,10 @@ private:
     QTimer              repaintTimer_;
 
     QVector<QPoint>    pts_uv_;  // u v 보관
+
+    bool  useFixedZ_ = true;   // 고정 범위로 색 입히기(추천)
+    float zMin_ = 0.3f;        // 0.3 m
+    float zMax_ = 6.0f;        // 6.0 m
 
     void ensureFB();
     void drawPoints();
