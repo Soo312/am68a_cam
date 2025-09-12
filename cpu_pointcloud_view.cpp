@@ -8,7 +8,7 @@
 
 #define TEST_BYPASS_ROTATION   0  // 1: 회전 완전 무시 (yaw/pitch 영향 배제)
 #define TEST_ORTHO_NO_DIV_Z    0  // 1: 원근 나눗셈(u=x/z,v=y/z) 금지 → u=x, v=y
-#define TEST_FAKE_Z_POSITIVE   0  // 1: 모든 점의 Z'를 안전`한 양수로 강제
+#define TEST_FAKE_Z_POSITIVE   0  // 1: 모든 점의 Z'를 안전한 양수로 강제
 
 CPUPointCloudView::CPUPointCloudView(QWidget* parent)
     :QWidget(parent)
