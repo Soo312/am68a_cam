@@ -29,6 +29,16 @@ public:
          zMin_ = zmin_m; zMax_ = zmax_m; useFixedZ_ = useFixed;
     }
 
+
+public slots:
+    void setProjectionIntrinsics(float fx, float fy, float cx, float cy)
+    {
+        fx_pix_ = fx;
+        fy_pix_ = fy;
+        cx_pix_ = cx;
+        cy_pix_ = cy;
+        update();
+    }
 protected:
     void paintEvent(QPaintEvent*) override;
     void resizeEvent(QResizeEvent*) override;
@@ -51,6 +61,15 @@ private:
 
     void ensureFB();
     void drawPoints();
+
+public:
+    bool  usePerspective_ = true;    //*** 수정  원근 투영 on/off (원하면 토글)
+    float fx_pix_ = 600.f;           //*** 수정  보기용 fx(px)
+    float fy_pix_ = 600.f;           //*** 수정  보기용 fy(px)
+    float cx_pix_ = 0.f;             //*** 수정  화면 중심 X(px)
+    float cy_pix_ = 0.f;             //*** 수정  화면 중심 Y(px)
+    float camZ_   = 1.0f;            //*** 수정  카메라-장면 거리(장면 단위, m 권장)
+    float nearZ_  = 0.01f;           //*** 수정  전면 클리핑(투영 안정)
 
 };
 

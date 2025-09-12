@@ -47,6 +47,9 @@ signals:
                           size_t sizeFilled,
                           size_t strideBytes);
 
+    void projectionIntrinsicsReady(float fx, float fy,
+                                   float cx, float cy);
+
 public :
     void onFrameRaw(Arena::IImage* img);
     bool takeLatestPointCloud

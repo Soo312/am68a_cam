@@ -943,6 +943,9 @@ CameraWorker::CameraWorker(QWidget *parent)
     connect(tof_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
+    connect(tof_worker_, &CaptureWorker::projectionIntrinsicsReady, pcView_,
+            &CPUPointCloudView::setProjectionIntrinsics, Qt::QueuedConnection);
+
 
     vis_worker_->setSystem(sys_);
     tof_worker_->setSystem(sys_);
@@ -1191,7 +1194,14 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
                     const float cx = w * 0.5f, cy = h * 0.5f;
                     const float fx = 580.0f,   fy = 580.0f;
                     s_lut_ready = BuildBackProjLUT(w, h, fx, fy, cx, cy, s_lut);
+
+                    if (s_lut_ready)
+                    {
+                        emit projectionIntrinsicsReady
+                                (fx,fy,cx,cy);
+                    }
                 }
+
 
                 // --- C16 → XYZ 포인트클라우드 ---
                 QVector<QVector3D>& workPts = pcBuf_[pcIdx_];

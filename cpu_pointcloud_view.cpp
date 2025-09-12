@@ -107,9 +107,16 @@ void CPUPointCloudView::paintEvent(QPaintEvent* ev)
     p.drawImage(0, 0, fb_);
 }
 
-void CPUPointCloudView::resizeEvent(QResizeEvent*)
+void CPUPointCloudView::resizeEvent(QResizeEvent* e)
 {
-    update();
+
+    QWidget::resizeEvent(e);                                //*** 수정
+    cx_pix_ = width()  * 0.5f;                              //*** 수정
+    cy_pix_ = height() * 0.5f;                              //*** 수정
+    fx_pix_ = std::max(1, width())  * 0.03f;                 //*** 수정
+    fy_pix_ = std::max(1, height()) * 0.03f;                 //*** 수정
+
+    //update();
 }
 
 void CPUPointCloudView::ensureFB()
@@ -153,6 +160,16 @@ void CPUPointCloudView::drawPoints()
         const int   H  = fb_.height();
         const float cx = W * 0.5f;
         const float cy = H * 0.5f;
+
+        if (!(fx_pix_ > 0.f) || !(fy_pix_ > 0.f))
+        {
+            fx_pix_ = std::max(1, W) * 0.6f;   // 너무 좁지도 넓지도 않게
+            fy_pix_ = std::max(1, H) * 0.6f;   //*** 수정
+        }
+
+            cx_pix_ = W * 0.5f;                //*** 수정
+            cy_pix_ = H * 0.5f;                //*** 수정
+
 
         // 점군 로컬 복사 (락 최소화)
         QVector<QVector3D> pts;
@@ -231,8 +248,24 @@ void CPUPointCloudView::drawPoints()
 
         const float rangeX = maxX - minX;
         const float rangeY = maxY - minY;
+        const float rangeZ = maxZ - minZ;
+        const float sceneRadiusXY = 0.5f * std::max(rangeX, rangeY); //*** 수정
+
+        //*** 수정  시야각을 fx로부터 환산해 Auto-fit (수평 FOV)
+        const float halfFov = std::atan( (W * 0.5f) / std::max(1.f, fx_pix_) );   //*** 수정
+
+        //*** 수정  장면이 화면에 들어오도록 카메라 z 재설정(너무 앞이면 뒤로)
+        const float camZ_need = sceneRadiusXY / std::tan(halfFov) + 0.5f*rangeZ + 1e-3f; //*** 수정
+        if (!(camZ_ > camZ_need*0.4f)) {          // 너무 앞에 있으면 당장 뒤로 민다       //*** 수정
+            camZ_ = camZ_need;                    //*** 수정
+        }
+
+        //*** 수정  전면 클리핑 안정화
+        nearZ_ = std::max(nearZ_, 0.001f);
+
         const float midX   = 0.5f * (minX + maxX);
         const float midY   = 0.5f * (minY + maxY);
+        const float midZ = (minZ + maxZ) * 0.5f;
 
         // 화면을 95% 채우도록 동일비율 스케일
         const float scaleX = 0.95f * W / (rangeX > 0 ? rangeX : 1e-6f);
@@ -267,21 +300,23 @@ void CPUPointCloudView::drawPoints()
         {
             const QVector3D& p = rpts[i];
 
-            // 정사영: X,Y만 사용 (Y는 화면 상하 반전)
-            const float sx = S * (p.x() - midX) + cx;
-            const float sy = S * (-(p.y() - midY)) + cy;
+            // 중심 정렬 후 카메라 앞쪽으로 배치해서 원근 투영                       //*** 수정
+            const float qx = p.x() - midX;                                           //*** 수정
+            const float qy = p.y() - midY;                                           //*** 수정
+            const float qz = (p.z() - midZ) + camZ_;                                 //*** 수정
+            if (!(qz > nearZ_))                                                      //*** 수정
+                continue;                                                            //*** 수정
 
-            const int ix = (int)std::lround(sx);
-            const int iy = (int)std::lround(sy);
+            const float sx = fx_pix_ * (qx / qz) + cx_pix_;                          //*** 수정
+            const float sy = fy_pix_ * (-(qy / qz)) + cy_pix_;                       //*** 수정
 
-            //if ((unsigned)ix < (unsigned)W && (unsigned)iy < (unsigned)H)
-            //{
-            //    putPixel(ix, iy);
-            //    ++plotted;
-            //}
+            const int ix = (int)std::lround(sx);                                     //*** 수정
+            const int iy = (int)std::lround(sy);                                     //*** 수정
+            if ((unsigned)ix >= (unsigned)W || (unsigned)iy >= (unsigned)H)          //*** 수정
+                continue;                                                            //*** 수정
 
-            const QRgb col = colorFromZ(p.z());      // ***
-            putPixelZ(ix, iy, p.z(), col);           // ***
+            const QRgb col = colorFromZ(p.z());                                      //*** 수정
+            putPixelZ(ix, iy, qz, col);
         }
 
         //qDebug() << "[FLAT] plotted:" << plotted
