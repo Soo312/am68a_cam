@@ -56,6 +56,8 @@ public :
     (
         const QVector<QVector3D>*& outPts,
         const QVector<quint16>*&   outConf,
+        const QVector<QPoint>*& outImgPts,
+        const QVector<float>*& outZ0,
         int& outW,
         int& outH
     );
@@ -74,12 +76,14 @@ private:
     QImage visBuf_[2];
     int    visIdx_ = 0;
 
+    QVector<QPoint>    imgPtsBuf_[2];
+    QVector<float>     z0Buf_[2];
+
 
 
 public:
     void setSystem(Arena::ISystem* s);
     int camIdx_ = -1;
-
     // 포인트클라우드 더블버퍼 (ToF 전용)
 private:
     QVector<QVector3D> pcBuf_[2];
@@ -115,7 +119,11 @@ private slots:
                      size_t height,
                      size_t sizeFilled);
 
-  void setPointCloudView(CPUPointCloudView* view){pcView_ = view;}
+  void setPointCloudView(CPUPointCloudView* view)
+  {
+      pcView_ = view;
+      pcView_->setPureProjection(true);
+  }
 
   //Tof 타이머 슬롯
   void onPcPoll();

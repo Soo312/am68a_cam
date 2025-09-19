@@ -37,15 +37,7 @@ struct BackProjLUT
 
 bool BuildBackProjLUT(int w, int h, float fx, float fy, float cx, float cy, BackProjLUT& lut);
 
-bool extractPointCloudC16(Arena::IImage* img,
-                          const BackProjLUT& lut,
-                          float zScale,              // ex) 0.001f (mm→m)
-                          uint16_t zInvalid,         // ex) 0x8000
-                          uint16_t zMinValid,        // ex) 300   (mm)  필요 없으면 0
-                          uint16_t zMaxValid,        // ex) 6000  (mm)  필요 없으면 0
-                          QVector<QVector3D>& outPts,
-                          int* outW = nullptr,
-                          int* outH = nullptr);
+
 
 class ImageRenderHelper
 {
@@ -76,6 +68,18 @@ public:
             int* outH = nullptr
 
             );
+    static bool extractPointCloudC16(Arena::IImage* img,
+                              const BackProjLUT& lut,
+                              float zScale,              // ex) 0.001f (mm→m)
+                              uint16_t zInvalid,         // ex) 0x8000
+                              uint16_t zMinValid,        // ex) 300   (mm)  필요 없으면 0
+                              uint16_t zMaxValid,        // ex) 6000  (mm)  필요 없으면 0
+                              QVector<QVector3D>& outPts,
+                              QVector<QPoint>* outImgPts,
+                              int* outW = nullptr,
+                              int* outH = nullptr,
+                              QVector<float>* outZ0 = nullptr);
+
     static inline size_t calcStepBytes(Arena::IImage* img);
 
 private:

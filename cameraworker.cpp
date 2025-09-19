@@ -755,11 +755,11 @@ void CaptureWorker::start()
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
 
-
         auto w = GenApi::CIntegerPtr(dMap->GetNode("Width"));
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
         if (w && GenApi::IsWritable(w)) w->SetValue(640);
         if (h && GenApi::IsWritable(h)) h->SetValue(480);
+
     }
     else
     {
@@ -994,7 +994,7 @@ void CameraWorker::handleTermKey(char ch)
             pcView_->orbitBy(+5.0f, 0.0f);
             break;
         case 'q': case 'Q':
-            pcView_->zoomBy(+20.0f);
+            pcView_->keyPressEvent(nullptr);
             break;
         case 'e': case 'E':
             pcView_->zoomBy(-20.0f);
@@ -1097,10 +1097,12 @@ void CameraWorker::onPcPoll()
 
     const QVector<QVector3D>* pts = nullptr;
     const QVector<quint16>* conf = nullptr;
+    const QVector<QPoint>*    img  = nullptr;
+    const QVector<float>*     z0   = nullptr;
     int w = 0;
     int h = 0;
 
-    const bool ok = tof_worker_->takeLatestPointCloud(pts, conf, w, h);
+    const bool ok = tof_worker_->takeLatestPointCloud(pts, conf,img,z0, w, h);
     if (!ok)
     {
         // 아직 새 데이터 없음
@@ -1113,7 +1115,8 @@ void CameraWorker::onPcPoll()
 
     if (pts && !pts->isEmpty())
     {
-        pcView_->updatePointCloud(*pts);
+        //pcView_->updatePointCloud(*pts);
+        pcView_->updatePointCloudWithPts(*pts, *img, *z0);
     }
 }
 
@@ -1147,6 +1150,7 @@ static QImage MakeGrayFromABCY16(const uint8_t* data,
 
 static BackProjLUT s_lut;
 static bool s_lut_ready = false;
+QVector<float> z0;
 
 void CaptureWorker::onFrameRaw(Arena::IImage *img)
 {
@@ -1209,16 +1213,25 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
                 workPts.clear();
                 workCnf.clear();
 
+                QVector<QPoint> outImgpts;
+
                 const uint16_t zInvalid = 0x8000; // Helios 무효값
-                const uint16_t zMin     = 300;    // (옵션) 0.3m 미만 제거
-                const uint16_t zMax     = 6000;   // (옵션) 6m 초과 제거
-                const float    zScale   = 0.001f; // mm → m
+                const uint16_t zMin     = 600;    // (옵션) 0.3m 미만 제거
+                const uint16_t zMax     = 24000;   // (옵션) 6m 초과 제거
+                const float    zScale   = 0.00025f; // mm → m
 
                 if (s_lut_ready &&
-                    extractPointCloudC16(copy, s_lut, zScale,
+                    ImageRenderHelper::extractPointCloudC16(copy, s_lut, zScale,
                                                            zInvalid, zMin, zMax,
-                                                           workPts, &lastW_, &lastH_))
+                                                           workPts, &outImgpts,
+                                         &lastW_, &lastH_
+                                         , &z0))
                 {
+
+                    pcBuf_[pcIdx_]     = std::move(workPts);    // 3D 포인트
+                    imgPtsBuf_[pcIdx_] = std::move(outImgpts);  // 원본 이미지 좌표
+                    z0Buf_[pcIdx_]     = std::move(z0);         // 처음 좌표계 Z (카메라 Z축, m)
+
                     // 더블버퍼 토글 + 새 데이터 플래그
                     pcIdx_ ^= 1;
                     pcHasNew_ = true;  // onPcPoll()에서 읽음
@@ -1250,7 +1263,7 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
     // else: 프리뷰 없으면 emit 생략 (포인트클라우드는 onPcPoll()에서 갱신)
 }
 
-bool CaptureWorker::takeLatestPointCloud(const QVector<QVector3D> *&outPts, const QVector<quint16> *&outConf, int &outW, int &outH)
+bool CaptureWorker::takeLatestPointCloud(const QVector<QVector3D> *&outPts, const QVector<quint16> *&outConf, const QVector<QPoint> *&outImgPts, const QVector<float> *&outZ0, int &outW, int &outH)
 {
     if(!pcHasNew_.exchange((false)))
     {
@@ -1260,6 +1273,11 @@ bool CaptureWorker::takeLatestPointCloud(const QVector<QVector3D> *&outPts, cons
     const int readIdx = pcIdx_ ^1;
     outPts = &pcBuf_[readIdx];
     outConf = &confBuf_[readIdx];
+
+
+    outImgPts = imgPtsBuf_[readIdx].isEmpty() ? nullptr : &imgPtsBuf_[readIdx];
+    outZ0     = z0Buf_[readIdx].isEmpty()     ? nullptr : &z0Buf_[readIdx];
+
     outW = lastW_;
     outH = lastH_;
 

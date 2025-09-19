@@ -204,16 +204,22 @@ bool BuildBackProjLUT(int w, int h, float fx, float fy, float cx, float cy, Back
     }
 }
 
-bool extractPointCloudC16(Arena::IImage* img,
+bool ImageRenderHelper::extractPointCloudC16(Arena::IImage* img,
                           const BackProjLUT& lut,
                           float zScale,
                           uint16_t zInvalid,
                           uint16_t zMinValid,
                           uint16_t zMaxValid,
                           QVector<QVector3D>& outPts,
+                          QVector<QPoint>* outImgPts,
                           int* outW,
-                          int* outH)
+                          int* outH,
+                          QVector<float>* outZ0)
 {
+
+    static int frameNo = 0;
+    size_t nInvalid=0, nLt2m=0, nGe2m=0, nGe25m=0;
+
     if (!img)
     {
         return false;
@@ -245,6 +251,24 @@ bool extractPointCloudC16(Arena::IImage* img,
     outPts.clear();
     outPts.reserve(w * h / 2); // 대충 절반 잡기 (필요 시 조정)
 
+    if (outImgPts)
+    {
+        outImgPts->clear();
+        outImgPts->reserve(w * h / 2);
+    }
+
+    if (outZ0)
+    {
+        outZ0->clear();
+        outZ0->reserve(w * h / 2);
+    }
+
+    static bool kC16IsRange = true;
+    static float kZ_A = 1.000f;
+    static float kZ_B = 0.000f;
+    static float kZ_C = 0.000f;
+
+
     for (int y = 0; y < h; ++y)
     {
         const uint16_t* row = reinterpret_cast<const uint16_t*>(base + y * stepBytes);
@@ -265,19 +289,62 @@ bool extractPointCloudC16(Arena::IImage* img,
                 continue;
             }
 
+            float Zs = Zraw * zScale;
+            if (Zs < 2.0f) nLt2m++;
+            else           nGe2m++;
+
             const QVector2D r = lut.ray[y * w + x]; // ((u-cx)/fx, (v-cy)/fy)
 
-            const float Z = float(Zraw) * zScale;
-            const float X = r.x() * Z;
-            const float Y = r.y() * Z;
+            //const float Z = float(Zraw) * zScale;
+
+
+            float rx = r.x();
+            float ry = r.y();
+
+            //float Zs = float(Zraw) * zScale;
+
+            float Zaxis = Zs;
+
+            if(kC16IsRange)
+            {
+                const float invCos = std::sqrt(1.0f + rx*rx + ry * ry);
+                Zaxis = Zs /  invCos;
+            }
+
+            //const float Zcorr = (kZ_A * Zaxis) + kZ_B + (kZ_C * Zaxis * Zaxis);
+            const float Zcorr = Zaxis;
+
+            const float X = rx * Zcorr;
+            const float Y = ry * Zcorr;
+
+            outPts.push_back(QVector3D(X,-Y,Zcorr));
+
+            if(outImgPts)
+            {
+                outImgPts->push_back((QPoint(x,y)));
+            }
+
+            if (outZ0) outZ0->push_back(Zaxis);
+
+
+            //const float X = r.x() * Z;
+            //const float Y = r.y() * Z;
 
             // (시각계 상하 뒤집기 원하면 Y = -Y)
-            outPts.push_back(QVector3D(X, -Y, Z));
+            //outPts.push_back(QVector3D(X, -Y, Z));
         }
     }
 
     if (outW) *outW = w;
     if (outH) *outH = h;
+
+    qDebug() << "[DEPTH] frame" << frameNo++
+             << "invalid=" << nInvalid
+             << "lt2m=" << nLt2m
+             << "ge2m=" << nGe2m
+             << "ge2.5m=" << nGe25m
+             << "zMinValid=" << zMinValid
+             << "zMaxValid=" << zMaxValid;
 
     return !outPts.isEmpty();
 }
