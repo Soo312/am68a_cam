@@ -67,6 +67,7 @@ private:
     QImage              fb_;
     QTimer              repaintTimer_;
 
+
     bool pureProj_ = false;
 
     QVector<QPoint>    pts_uv_;  // u v 보관
@@ -93,6 +94,8 @@ public:
 
     QVector<QPoint> imgPts_;   // 원본 픽셀 좌표
     QVector<float> z0_;
+
+    QImage  depthImage_;
 
 
 };

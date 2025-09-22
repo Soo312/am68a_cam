@@ -145,9 +145,15 @@ void CPUPointCloudView::paintEvent(QPaintEvent* ev)
     drawPoints();
 
     QPainter p(this);
-    p.setRenderHint(QPainter::Antialiasing, false);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
-    p.drawImage(0, 0, fb_);
+    //p.drawImage(0, 0, fb_);
+    p.setOpacity(0.3);
+    p.drawImage(0,0,depthImage_);
+
+    p.setOpacity(1.0);
+    p.drawImage(0,0,fb_);
+    //p.setRenderHint(QPainter::Antialiasing, false);
+    //p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+
 }
 
 void CPUPointCloudView::resizeEvent(QResizeEvent* e)

@@ -84,6 +84,7 @@ private:
 public:
     void setSystem(Arena::ISystem* s);
     int camIdx_ = -1;
+    float scaleX_=1.f, offX_=0.f, scaleY_=1.f, offY_=0.f, scaleZ_=1.f, offZ_=0.f;
     // 포인트클라우드 더블버퍼 (ToF 전용)
 private:
     QVector<QVector3D> pcBuf_[2];

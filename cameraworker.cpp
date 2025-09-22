@@ -755,6 +755,63 @@ void CaptureWorker::start()
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
 
+        GenApi::CEnumerationPtr op = dMap->GetNode("Scan3dOperatingMode");
+        if (op && GenApi::IsWritable(op)) {
+            // 사용 가능 목록 로깅도 권장
+            // for (auto it = op->GetEntries()->Begin(); it != op->GetEntries()->End(); ++it) qDebug() << (*it)->GetSymbolic();
+            if (GenApi::IsReadable(op->GetEntryByName("Distance8300mmMultiFreq")))
+                op->FromString("Distance8300mmMultiFreq");
+            else if (GenApi::IsReadable(op->GetEntryByName("Distance6000mmSingleFreq")))
+                op->FromString("Distance6000mmSingleFreq");
+            // 장치에 따라 이름 다름
+        }
+
+
+        {
+            GenApi::CEnumerationPtr sel = dMap->GetNode("Scan3dCoordinateSelector");
+            GenApi::CFloatPtr sc = dMap->GetNode("Scan3dCoordinateScale");
+            GenApi::CFloatPtr of = dMap->GetNode("Scan3dCoordinateOffset");
+            if (sel && sc && of) {
+                sel->FromString("CoordinateA");
+                scaleX_ = (float)sc->GetValue();
+                offX_ = (float)of->GetValue();
+                sel->FromString("CoordinateB");
+                scaleY_ = (float)sc->GetValue();
+                offY_ = (float)of->GetValue();
+                sel->FromString("CoordinateC");
+                scaleZ_ = (float)sc->GetValue();
+                offZ_ = (float)of->GetValue();
+            }
+        }
+
+        // 4) 스트림 안정화
+        {
+            GenApi::CBooleanPtr autoPkt = sMap->GetNode("StreamAutoNegotiatePacketSize");
+            if (autoPkt && GenApi::IsWritable(autoPkt))
+                autoPkt->SetValue(true);
+            GenApi::CBooleanPtr resend = sMap->GetNode("StreamPacketResendEnable");
+            if (resend && GenApi::IsWritable(resend))
+                resend->SetValue(true);
+        }
+
+        // 5) Confidence / FlyingPixel / MinDistanceOffset (권장)
+        {
+            // ConfidenceThreshold 낮추기(예: 0~100 사이) → 너무 공격적이면 근거리 검정 많아짐
+            if (auto n = GenApi::CIntegerPtr(dMap->GetNode("ConfidenceThreshold")); n && GenApi::IsWritable(n)) {
+                n->SetValue(/*예:*/ 10);
+            }
+            // FlyingPixelFilter 완화/Off
+            if (auto n = GenApi::CBooleanPtr(dMap->GetNode("FlyingPixelFilter")); n && GenApi::IsWritable(n)) {
+                n->SetValue(false);
+            }
+            // MinDistanceOffset 줄이기(근거리 허용)
+            if (auto n = GenApi::CFloatPtr(dMap->GetNode("MinDistanceOffset")); n && GenApi::IsWritable(n)) {
+                n->SetValue(0.0); // 장치 허용 범위 내
+            }
+            // Exposure / ModulationFrequency 등은 장면에 맞춰 조절
+        }
+
+
         auto w = GenApi::CIntegerPtr(dMap->GetNode("Width"));
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
         if (w && GenApi::IsWritable(w)) w->SetValue(640);
@@ -1217,8 +1274,8 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
 
                 const uint16_t zInvalid = 0x8000; // Helios 무효값
                 const uint16_t zMin     = 600;    // (옵션) 0.3m 미만 제거
-                const uint16_t zMax     = 24000;   // (옵션) 6m 초과 제거
-                const float    zScale   = 0.00025f; // mm → m
+                const uint16_t zMax     = 40000;   // (옵션) 10m 초과 제거
+                const float    zScale   = scaleZ_ / 1000; // mm → m
 
                 if (s_lut_ready &&
                     ImageRenderHelper::extractPointCloudC16(copy, s_lut, zScale,
@@ -1237,7 +1294,24 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
                     pcHasNew_ = true;  // onPcPoll()에서 읽음
 
                     // (옵션) 2D 히트맵도 만들기 — UI에서 보고 싶을 때
-                    ImageRenderHelper::makeDepthFalseColor(copy, /*zMin=*/0, /*zMax=*/0, qimg);
+                    ImageRenderHelper::makeDepthFalseColor(copy, zMin, zMax, qimg);
+
+
+                    QImage argb = qimg.convertToFormat(QImage::Format_ARGB32);
+
+                    for (int y = 0; y < argb.height(); ++y)
+                    {
+                        QRgb* line = reinterpret_cast<QRgb*>(argb.scanLine(y));
+                        for (int x = 0; x < argb.width(); ++x)
+                        {
+                            const QRgb c = line[x];
+                            // 완전 검정(또는 아주 어두운 픽셀)을 투명 처리
+                            if ((qRed(c) | qGreen(c) | qBlue(c)) < 8) {
+                                line[x] = qRgba(0, 0, 0, 0);  // 알파 0
+                            }
+                        }
+                    }
+
                     ok = !qimg.isNull();
                 }
             }

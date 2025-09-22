@@ -338,13 +338,7 @@ bool ImageRenderHelper::extractPointCloudC16(Arena::IImage* img,
     if (outW) *outW = w;
     if (outH) *outH = h;
 
-    qDebug() << "[DEPTH] frame" << frameNo++
-             << "invalid=" << nInvalid
-             << "lt2m=" << nLt2m
-             << "ge2m=" << nGe2m
-             << "ge2.5m=" << nGe25m
-             << "zMinValid=" << zMinValid
-             << "zMaxValid=" << zMaxValid;
+
 
     return !outPts.isEmpty();
 }
