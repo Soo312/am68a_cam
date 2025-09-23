@@ -1,17 +1,29 @@
 #ifndef CAMERAWORKER_H
 #define CAMERAWORKER_H
 
+#pragma once
 #include <QApplication>
 #include <QMainWindow>
 #include <QLabel>
 #include <QThread>
 #include <atomic>
 #include <QImage>
+#include <QObject>
+//#include "pose_estimate_onnx.h"
 
-QT_BEGIN_NAMESPACE
 namespace Ui { class CameraWorker; }
 namespace Arena { class ISystem; class IDevice; class IImage;}
-QT_END_NAMESPACE
+
+class PoseEstimatorONNX;
+
+struct PoseParams {
+    int   inputW = 640, inputH = 640;
+    bool  letterbox = true;
+    float confDet = 0.25f;
+    float confKpt = 0.20f;
+    float nmsIoU  = 0.45f;
+    bool  rgbInput = true;
+};
 
 class CaptureWorker : public QObject
 {
@@ -59,10 +71,24 @@ class CameraWorker : public QMainWindow {
 public:
   explicit CameraWorker(QWidget* parent=nullptr);
   ~CameraWorker();
+protected:
+  void keyPressEvent(QKeyEvent* ev) override;
+
 private slots:
   void onStart();
   void onSnapshot();
   void onFrame(int camidx, const QImage& img);
+    void handleTermKey(char ch);
+
+
+
+public slots:
+  void requestCapture();
+
+  void onFrameReady(int camIdx, const QImage& qimg);
+
+signals:
+  void frameReady(int camIdx, const QImage& qimg);
 
 private:
   Ui::CameraWorker* ui;
@@ -72,6 +98,13 @@ private:
   CaptureWorker* tof_worker_ = nullptr;
   CaptureWorker* vis_worker_ = nullptr;
   QImage lastFrame_;
+
+  std::atomic<bool> capturePending_{false};
+  QString captureDir_ = "/home/CameraWorker/captures";
+//포즈 추론
+  PoseEstimatorONNX* pose_ = nullptr;
+  bool poseReady_ = false;
+  PoseParams pPose_;
 
 public:
   Arena::ISystem* sys_ = nullptr;

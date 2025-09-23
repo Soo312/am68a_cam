@@ -8,6 +8,8 @@
 #include <QPixmap>
 #include <QDebug>
 #include <QTimer>
+#include <QPainter>
+#include <QKeyEvent>
 
 
 //Arena
@@ -15,7 +17,48 @@
 #include <GenApi/GenApi.h>
 
 #include <Base/GCException.h>
+
+#include "pose_estimate_onnx.h"
+#include "person_detect_onnx.h"
+
 using namespace std;
+
+static const int KPT_EDGES[][2] = {
+    {5,7},{7,9}, {6,8},{8,10}, {5,6}, {11,12},
+    {5,11},{6,12}, {11,13},{13,15}, {12,14},{14,16},
+    {0,5},{0,6},{0,1},{1,3},{0,2},{2,4}
+};
+
+static void drawPoseOverlay(QImage& img, const std::vector<PosePerson>& persons, float confKpt=0.2f)
+{
+    QPainter p(&img);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    QPen edgePen(Qt::green); edgePen.setWidth(2);
+    QPen kpPen(Qt::red);     kpPen.setWidth(6);
+    QPen boxPen(Qt::yellow); boxPen.setWidth(2);
+
+    for (const auto& per : persons) {
+        // bbox
+        p.setPen(boxPen);
+        p.drawRect(QRectF(per.x, per.y, per.w, per.h));
+
+        // keypoints
+        p.setPen(kpPen);
+        for (const auto& k : per.kpts)
+            if (k.c >= confKpt) p.drawPoint(QPointF(k.x, k.y));
+
+        // edges
+        p.setPen(edgePen);
+        for (auto e : KPT_EDGES) {
+            const auto& a = per.kpts[e[0]];
+            const auto& b = per.kpts[e[1]];
+            if (a.c >= confKpt && b.c >= confKpt)
+                p.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
+        }
+    }
+    p.end();
+}
 
 CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
     :QObject(p), hint_(std::move(hint)), isToF_(isToF),camIdx_(camIdx){}
@@ -511,6 +554,10 @@ void CaptureWorker::start()
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_ABCY16"); // 반복 시도 가능
         */
+        GenApi::CEnumerationPtr op = dMap->GetNode("Scan3dOperatingMode");
+
+        if (GenApi::IsReadable(op->GetEntryByName("Distance8300mmMultiFreq")))
+            op->FromString("Distance8300mmMultiFreq");
 
         auto w = GenApi::CIntegerPtr(dMap->GetNode("Width"));
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
@@ -672,6 +719,25 @@ CameraWorker::CameraWorker(QWidget *parent)
 
     vis_worker_->setSystem(sys_);
     tof_worker_->setSystem(sys_);
+    //AI 파라미터
+    {
+        if (!pose_) pose_ = new PoseEstimatorONNX();
+
+        //추가: 캡처 폴더 준비
+        QDir().mkpath(captureDir_);
+
+        //추가: 포즈 파라미터 & 초기화
+        pPose_.inputW     = 640;
+        pPose_.inputH     = 640;
+        pPose_.letterbox  = true;
+        pPose_.confDet    = 0.25f;   // bbox/obj 임계
+        pPose_.confKpt    = 0.20f;   // 키포인트 표시 임계
+        pPose_.nmsIoU     = 0.45f;
+        pPose_.rgbInput   = true;    // Gray8 → RGB(복제)로 넣을 것
+
+        poseReady_ = pose_->init("/home/CameraWorker/models/yolov8n-pose.onnx", pPose_, /*threads*/2);
+    }
+    connect(ui->btnCapture, &QPushButton::clicked, this, &CameraWorker::requestCapture);
 
     connect(ui->btnStart,   &QPushButton::clicked, this, &CameraWorker::onStart);
     connect(ui->btnSnapshot,&QPushButton::clicked, this, &CameraWorker::onSnapshot);
@@ -700,15 +766,28 @@ CameraWorker::~CameraWorker()
     delete ui;
 }
 
+void CameraWorker::keyPressEvent(QKeyEvent *event)
+{
+    if (event->key() == Qt::Key_K)
+    {
+        qDebug() << "K key pressed";
+        emit requestCapture();  // 또는 너의 캡처 로직 직접 호출
+    }
+    else
+    {
+        QMainWindow::keyPressEvent(event); // 다른 키는 기본 처리
+    }
+}
+
 void CameraWorker::onStart()
 {
 
     if (!tof_thread_.isRunning())
         tof_thread_.start();
-    QTimer::singleShot(600, this, [this]{
+    /*QTimer::singleShot(600, this, [this]{
         if (!vis_thread_.isRunning())
             vis_thread_.start();
-    });
+    });*/
    //vis_thread_.start();
 
 }
@@ -739,6 +818,111 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
                                         */
         ui->videoLabel_2->setPixmap(QPixmap::fromImage(img));
     }
+}
+
+void CameraWorker::handleTermKey(char ch)
+{
+    switch (ch)
+    {
+        case 'w': case 'W':
+
+            break;
+
+        case 'x': case 'X':
+            QCoreApplication::quit();
+            return;
+        default:
+            return;
+    }
+}
+
+void CameraWorker::requestCapture()
+{
+    capturePending_.store(true, std::memory_order_release);
+}
+
+void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
+{
+    // 1) 평소처럼 UI로 먼저 전달(원하면 순서 바꿔도 OK)
+    emit frameReady(camIdx, qimgIn);
+
+    // 2) 캡처 트리거 시에만 포즈 추론 + 저장
+    if (!capturePending_.load(std::memory_order_acquire))
+        return;
+
+    const auto ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz");
+    const QString rawPath  = captureDir_ + "/" + ts + "_raw.png";
+    const QString annPath  = captureDir_ + "/" + ts + "_pose.png";
+    const QString metaPath = captureDir_ + "/" + ts + "_pose.json";
+
+    // 입력 준비 (Gray8 → RGB888)
+    QImage infer = (qimgIn.format()==QImage::Format_RGB888) ? qimgIn
+                   : qimgIn.convertToFormat(QImage::Format_RGB888);
+
+    // 포즈 추론
+    std::vector<PosePerson> persons;
+    if (poseReady_) {
+        pose_->infer(infer.bits(), infer.width(), infer.height(), infer.bytesPerLine(), persons);
+    }
+
+    // 저장: 원본
+    qimgIn.save(rawPath);
+
+    // 저장: 오버레이
+    QImage annotated = qimgIn.copy();
+
+    // 간단한 오버레이(키포인트/에지)
+    QPainter p(&annotated);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QPen edge(Qt::green); edge.setWidth(2);
+    QPen kp(Qt::red);     kp.setWidth(6);
+    QPen box(Qt::yellow); box.setWidth(2);
+
+    static const int EDGES[][2] = {
+        {5,7},{7,9},{6,8},{8,10},{5,6},{11,12},{5,11},{6,12},
+        {11,13},{13,15},{12,14},{14,16},{0,5},{0,6},{0,1},{1,3},{0,2},{2,4}
+    };
+
+    for (const auto& per : persons) {
+        p.setPen(box);  p.drawRect(QRectF(per.x, per.y, per.w, per.h));
+        p.setPen(kp);   for (const auto& k : per.kpts) if (k.c >= pPose_.confKpt) p.drawPoint(QPointF(k.x, k.y));
+        p.setPen(edge); for (auto e : EDGES){
+            const auto& a=per.kpts[e[0]], &b=per.kpts[e[1]];
+            if (a.c >= pPose_.confKpt && b.c >= pPose_.confKpt)
+                p.drawLine(QPointF(a.x,a.y), QPointF(b.x,b.y));
+        }
+    }
+    p.end();
+
+    annotated.save(annPath);
+
+    // 메타 JSON
+    QFile meta(metaPath);
+    if (meta.open(QIODevice::WriteOnly|QIODevice::Truncate)) {
+        QTextStream os(&meta);
+        os << "{\n";
+        os << "  \"timestamp\":\"" << ts << "\",\n";
+        os << "  \"cam_idx\":" << camIdx << ",\n";
+        os << "  \"num_persons\":" << (int)persons.size() << ",\n";
+        os << "  \"persons\":[\n";
+        for (size_t i=0;i<persons.size();++i){
+            const auto& per=persons[i];
+            os << "    {\"bbox\":["<<per.x<<","<<per.y<<","<<per.w<<","<<per.h<<"],\"score\":"<<per.score<<",\"kpts\":[";
+            for (size_t k=0;k<per.kpts.size();++k){
+                const auto& kp = per.kpts[k];
+                os << "["<<kp.x<<","<<kp.y<<","<<kp.c<<"]";
+                if (k+1<per.kpts.size()) os << ",";
+            }
+            os << "]}";
+            if (i+1<persons.size()) os << ",\n"; else os << "\n";
+        }
+        os << "  ]\n";
+        os << "}\n";
+        meta.close();
+    }
+
+    capturePending_.store(false, std::memory_order_release);
+    //emit savedCapture(annPath);
 }
 
 void CaptureWorker::onFrameRaw(Arena::IImage *img)
@@ -774,7 +958,8 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
          else
          {
              // ToF: 기존 false color
-             ok = ImageRenderHelper::makeDepthFalseColor(copy, 300, 6000, qimg);
+
+             ok = ImageRenderHelper::makeDepthFalseColor(copy, 2400, 32000, qimg);
          }
 
          try { Arena::ImageFactory::Destroy(copy); } catch (...) {}
@@ -786,6 +971,8 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
      if (ok && !qimg.isNull())
      {
          lastOk = qimg;
+
+
          emit frameReady(camIdx_, qimg);
 
          visIdx_ ^= 1;

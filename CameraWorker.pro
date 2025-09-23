@@ -6,10 +6,15 @@ TARGET = CameraWorker
 
 SOURCES += main.cpp \
            ImageRenderHelper.cpp \
-           cameraworker.cpp
+           cameraworker.cpp \
+           person_detect_onnx.cpp \
+           pose_estimate_onxx.cpp
 
 HEADERS += cameraworker.h \
-           ImageRenderHelper.h
+           ImageRenderHelper.h \
+           depth_lift.h \
+           person_detect_onnx.h \
+           pose_estimate_onnx.h
 
 FORMS   += cameraworker.ui
 
@@ -23,12 +28,16 @@ INCLUDEPATH += \
     $$SDK/GenICam/library/CPP/include \
     $$SYSROOT/usr/include/opencv4
 
+INCLUDEPATH += /home/vmware/onnxrt-aarch64/include
+
 # 링크 디렉터리
 LIBS += -L$$SDK/lib
 LIBS += -L$$SDK/GenICam/library/lib/Linux64_ARM
 LIBS += -L$$SDK/GenTL
 LIBS += -L$$SYSROOT/usr/lib \
         -lopencv_core -lopencv_imgproc
+
+LIBS += -L/home/vmware/onnxrt-aarch64/lib -lonnxruntime
 
 QMAKE_LIBDIR += \
     $$SDK/lib \

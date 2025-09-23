@@ -86,13 +86,20 @@ bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
         zMin = (uint16_t)mn;
         zMax = (uint16_t)mx;
     }
+    if (zMax <= zMin) zMax = (uint16_t)(zMin + 1);            // //수정
+
+
     cv::Mat v8;
     const double scale = 255.0 / std::max(1, (int)zMax - (int)zMin);
     const double shift = -double(zMin) * scale;
     v16.convertTo(v8, CV_8U, scale, shift);
 
+    cv::Mat v8inv;                                            // //변경
+    cv::subtract(cv::Scalar::all(255), v8, v8inv);            // //변경
+
     cv::Mat bgr;
-    cv::applyColorMap(255 - v8, bgr, cv::COLORMAP_JET);
+    //cv::applyColorMap(255 - v8, bgr, cv::COLORMAP_JET);
+    cv::applyColorMap(v8inv, bgr, cv::COLORMAP_JET);
 
     // 범위 밖은 검정
     cv::Mat oob = (v16 < (uint16_t)zMin) | (v16 > (uint16_t)zMax);
