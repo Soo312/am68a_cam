@@ -6,12 +6,14 @@ TARGET = CameraWorker
 
 SOURCES += main.cpp \
            ImageRenderHelper.cpp \
+           TerminalInput.cpp \
            cameraworker.cpp \
            person_detect_onnx.cpp \
            pose_estimate_onxx.cpp
 
 HEADERS += cameraworker.h \
            ImageRenderHelper.h \
+           TerminalInput.h \
            depth_lift.h \
            person_detect_onnx.h \
            pose_estimate_onnx.h

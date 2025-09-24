@@ -24,6 +24,12 @@ struct PoseParams {
     float nmsIoU  = 0.45f;
     bool  rgbInput = true;
 };
+struct PoseKpt
+{
+    float x;
+    float y;
+    float conf;
+};
 
 class CaptureWorker : public QObject
 {
@@ -71,6 +77,7 @@ class CameraWorker : public QMainWindow {
 public:
   explicit CameraWorker(QWidget* parent=nullptr);
   ~CameraWorker();
+  void doCaptureAndPose();
 protected:
   void keyPressEvent(QKeyEvent* ev) override;
 
@@ -78,12 +85,13 @@ private slots:
   void onStart();
   void onSnapshot();
   void onFrame(int camidx, const QImage& img);
-    void handleTermKey(char ch);
 
 
 
 public slots:
   void requestCapture();
+  void handleTermKey(char ch);
+
 
   void onFrameReady(int camIdx, const QImage& qimg);
 

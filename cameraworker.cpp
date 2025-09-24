@@ -23,42 +23,16 @@
 
 using namespace std;
 
-static const int KPT_EDGES[][2] = {
-    {5,7},{7,9}, {6,8},{8,10}, {5,6}, {11,12},
-    {5,11},{6,12}, {11,13},{13,15}, {12,14},{14,16},
-    {0,5},{0,6},{0,1},{1,3},{0,2},{2,4}
+// COCO 17 keypoints 연결 (필요에 맞게 수정 가능)
+static const int EDGES[][2] = {
+    {5,7},{7,9},   // left arm: shoulder-elbow-wrist
+    {6,8},{8,10},  // right arm
+    {11,13},{13,15}, // left leg: hip-knee-ankle
+    {12,14},{14,16}, // right leg
+    {5,6}, {11,12},  // shoulders, hips
+    {5,11}, {6,12}   // torso diagonals (선택)
 };
-
-static void drawPoseOverlay(QImage& img, const std::vector<PosePerson>& persons, float confKpt=0.2f)
-{
-    QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing, true);
-
-    QPen edgePen(Qt::green); edgePen.setWidth(2);
-    QPen kpPen(Qt::red);     kpPen.setWidth(6);
-    QPen boxPen(Qt::yellow); boxPen.setWidth(2);
-
-    for (const auto& per : persons) {
-        // bbox
-        p.setPen(boxPen);
-        p.drawRect(QRectF(per.x, per.y, per.w, per.h));
-
-        // keypoints
-        p.setPen(kpPen);
-        for (const auto& k : per.kpts)
-            if (k.c >= confKpt) p.drawPoint(QPointF(k.x, k.y));
-
-        // edges
-        p.setPen(edgePen);
-        for (auto e : KPT_EDGES) {
-            const auto& a = per.kpts[e[0]];
-            const auto& b = per.kpts[e[1]];
-            if (a.c >= confKpt && b.c >= confKpt)
-                p.drawLine(QPointF(a.x, a.y), QPointF(b.x, b.y));
-        }
-    }
-    p.end();
-}
+static constexpr int EDGE_COUNT = sizeof(EDGES)/sizeof(EDGES[0]);
 
 CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
     :QObject(p), hint_(std::move(hint)), isToF_(isToF),camIdx_(camIdx){}
@@ -712,7 +686,7 @@ CameraWorker::CameraWorker(QWidget *parent)
     tof_worker_->moveToThread(&tof_thread_);
     connect(&tof_thread_, &QThread::started, tof_worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, tof_worker_, &CaptureWorker::stop);
-    connect(tof_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
+    connect(tof_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrameReady, Qt::QueuedConnection);
     connect(tof_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
@@ -779,6 +753,119 @@ void CameraWorker::keyPressEvent(QKeyEvent *event)
     }
 }
 
+static QString tsNow()
+{
+    return QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz");
+}
+
+void CameraWorker::doCaptureAndPose()
+{
+    if (lastFrame_.isNull())
+    {
+        qWarning() << "[K] lastFrame_ is null. Skip.";
+        return;
+    }
+
+    // 1. 캡처 디렉토리 준비
+    QDir().mkpath(captureDir_);
+
+    // 2. 파일 경로
+    const QString base     = captureDir_ + "/" + tsNow();
+    const QString rawPath  = base + "_raw.png";
+    const QString posePath = base + "_pose.png";
+
+    // 3. 이미지 저장
+    if (lastFrame_.save(rawPath))
+        qInfo() << "[K] saved raw:" << rawPath;
+    else
+        qWarning() << "[K] save raw failed:" << rawPath;
+
+    // 4. 이미지 포맷 확인
+    QImage inferImg = lastFrame_;
+    if (pPose_.rgbInput)
+    {
+        if (inferImg.format() != QImage::Format_RGB888)
+            inferImg = inferImg.convertToFormat(QImage::Format_RGB888);
+    }
+    else
+    {
+        if (inferImg.format() != QImage::Format_Grayscale8)
+            inferImg = inferImg.convertToFormat(QImage::Format_Grayscale8);
+    }
+
+    // 5. 포즈 추론
+    std::vector<PosePerson> persons;
+    bool ok = pose_->infer(
+        inferImg.bits(),
+        inferImg.width(),
+        inferImg.height(),
+        inferImg.bytesPerLine(),
+        persons
+    );
+
+    if (!ok)
+    {
+        qWarning() << "[K] pose infer failed.";
+        return;
+    }
+
+    qInfo() << "[K] persons =" << persons.size();
+
+    // 6. 스켈레톤 오버레이 그리기
+    QImage vis = lastFrame_.convertToFormat(QImage::Format_RGB888);
+
+    {
+        QPainter p(&vis);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        QPen pen(Qt::green); pen.setWidth(3); p.setPen(pen);
+        QFont f = p.font(); f.setPointSize(10); p.setFont(f);
+
+        for (size_t pi = 0; pi < persons.size(); ++pi)
+        {
+            const auto& person = persons[pi];
+            const auto& kpts = person.kpts; // 네 구조에 맞게 조정 필요
+
+            // 연결 선
+            for (int i = 0; i < EDGE_COUNT; ++i)
+            {
+                int a = EDGES[i][0], b = EDGES[i][1];
+                if (a < (int)kpts.size() && b < (int)kpts.size()
+                    && kpts[a].conf > 0.2f && kpts[b].conf > 0.2f)
+                {
+                    p.drawLine(QPointF(kpts[a].x, kpts[a].y),
+                               QPointF(kpts[b].x, kpts[b].y));
+                }
+            }
+
+            // 관절 점
+            for (const auto& k : kpts)
+            {
+                if (k.conf > 0.2f)
+                    p.drawEllipse(QPointF(k.x, k.y), 3, 3);
+            }
+
+            // (선택) 바운딩 박스 그리기
+            // if (person.bbox.width > 0)
+            // {
+            //     QRectF rc(person.bbox.x, person.bbox.y,
+            //              person.bbox.width, person.bbox.height);
+            //     p.drawRect(rc);
+            //     p.drawText(rc.topLeft() + QPointF(2,-2), QString("person %1").arg(pi));
+            // }
+        }
+    }
+
+    // 7. 결과 이미지 저장
+    if (vis.save(posePath))
+        qInfo() << "[K] saved pose overlay:" << posePath;
+    else
+        qWarning() << "[K] save pose failed:" << posePath;
+
+    // 8. 뷰 갱신 (선택)
+    // lastFrame_ = vis;
+    // emit frameReady(-1, vis);
+}
+
 void CameraWorker::onStart()
 {
 
@@ -824,9 +911,10 @@ void CameraWorker::handleTermKey(char ch)
 {
     switch (ch)
     {
-        case 'w': case 'W':
-
-            break;
+        case 'k': case 'K':
+            doCaptureAndPose();
+            emit requestCapture();
+        break;
 
         case 'x': case 'X':
             QCoreApplication::quit();
@@ -845,6 +933,8 @@ void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
 {
     // 1) 평소처럼 UI로 먼저 전달(원하면 순서 바꿔도 OK)
     emit frameReady(camIdx, qimgIn);
+
+        onFrame(1,qimgIn);
 
     // 2) 캡처 트리거 시에만 포즈 추론 + 저장
     if (!capturePending_.load(std::memory_order_acquire))
@@ -868,6 +958,8 @@ void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
     // 저장: 원본
     qimgIn.save(rawPath);
 
+
+
     // 저장: 오버레이
     QImage annotated = qimgIn.copy();
 
@@ -885,10 +977,10 @@ void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
 
     for (const auto& per : persons) {
         p.setPen(box);  p.drawRect(QRectF(per.x, per.y, per.w, per.h));
-        p.setPen(kp);   for (const auto& k : per.kpts) if (k.c >= pPose_.confKpt) p.drawPoint(QPointF(k.x, k.y));
+        p.setPen(kp);   for (const auto& k : per.kpts) if (k.conf >= pPose_.confKpt) p.drawPoint(QPointF(k.x, k.y));
         p.setPen(edge); for (auto e : EDGES){
             const auto& a=per.kpts[e[0]], &b=per.kpts[e[1]];
-            if (a.c >= pPose_.confKpt && b.c >= pPose_.confKpt)
+            if (a.conf >= pPose_.confKpt && b.conf >= pPose_.confKpt)
                 p.drawLine(QPointF(a.x,a.y), QPointF(b.x,b.y));
         }
     }
@@ -910,7 +1002,7 @@ void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
             os << "    {\"bbox\":["<<per.x<<","<<per.y<<","<<per.w<<","<<per.h<<"],\"score\":"<<per.score<<",\"kpts\":[";
             for (size_t k=0;k<per.kpts.size();++k){
                 const auto& kp = per.kpts[k];
-                os << "["<<kp.x<<","<<kp.y<<","<<kp.c<<"]";
+                os << "["<<kp.x<<","<<kp.y<<","<<kp.conf<<"]";
                 if (k+1<per.kpts.size()) os << ",";
             }
             os << "]}";

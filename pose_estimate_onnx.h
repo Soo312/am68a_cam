@@ -7,7 +7,6 @@
 #include <onnxruntime_cxx_api.h>
 #include "cameraworker.h"
 
-struct PoseKpt { float x, y, c; };          // 좌표 + confidence
 struct PosePerson {
     float x, y, w, h, score;                // bbox
     std::vector<PoseKpt> kpts;              // 17개
