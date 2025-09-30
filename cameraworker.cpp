@@ -34,6 +34,76 @@ static const int EDGES[][2] = {
 };
 static constexpr int EDGE_COUNT = sizeof(EDGES)/sizeof(EDGES[0]);
 
+static QImage mono16ToGray16_QImage(Arena::IImage* img)
+{
+    if (!img || img->GetBitsPerPixel() != 16) return QImage();
+
+    const int w = (int)img->GetWidth();
+    const int h = (int)img->GetHeight();
+
+    const int bpp  = (int)img->GetBitsPerPixel();  // 기대: 24
+    const int bypp = (bpp + 7) / 8;                 // 3
+    const size_t filled = img->GetSizeFilled();
+    const int srcStride = (h > 0 && (filled % (size_t)h) == 0)
+                        ? (int)(filled / (size_t)h)
+                        : (w * bypp);
+
+    const uint8_t* base = static_cast<const uint8_t*>(img->GetData());
+
+#if QT_VERSION >= QT_VERSION_CHECK(5, 13, 0)
+    QImage out(w, h, QImage::Format_Grayscale16);
+    const int dstBpl = out.bytesPerLine();            // 보통 w*2
+    for (int y = 0; y < h; ++y)
+    {
+        const void* srcLine = base + (size_t)y * srcStride;
+        void*       dstLine = out.scanLine(y);
+        // 픽셀 유효 바이트(w*2)만 복사 (dstBpl이 더 크면 남는 건 0 유지)
+        std::memcpy(dstLine, srcLine, (size_t)w * 2);
+        // 필요시: 남는 바이트가 있으면 0으로 채우기 (생략 가능)
+        // if (dstBpl > w*2) std::memset((uint8_t*)dstLine + w*2, 0, dstBpl - w*2);
+    }
+    return out;
+#else
+    // Qt 5.12 이하: 16비트를 그대로 보여줄 수 없으므로 8비트로 단순 축소(손실)
+    QImage out(w, h, QImage::Format_Grayscale8);
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(base + (size_t)y * srcBpl);
+        uint8_t* dst = out.scanLine(y);
+        for (int x = 0; x < w; ++x) dst[x] = uint8_t(src[x] >> 8); // 상위바이트만 (간단)
+    }
+    return out;
+#endif
+}
+
+static inline Letterbox makeLetterbox(int srcW, int srcH, int netW, int netH)
+{
+    Letterbox lb{};
+    float rW = float(netW) / srcW;
+    float rH = float(netH) / srcH;
+    lb.scale = std::min(rW, rH);
+    lb.padX  = (netW - srcW * lb.scale) * 0.5f;
+    lb.padY  = (netH - srcH * lb.scale) * 0.5f;
+    lb.netW  = netW;
+    lb.netH  = netH;
+    return lb;
+}
+
+static inline QPointF unletterboxPoint(const QPointF& pNet, const Letterbox& lb)
+{
+    return QPointF((pNet.x() - lb.padX) / lb.scale,
+                   (pNet.y() - lb.padY) / lb.scale);
+}
+
+static inline QRectF unletterboxRect(const QRectF& rNet, const Letterbox& lb)
+{
+    QPointF tl = unletterboxPoint(rNet.topLeft(), lb);
+    QPointF br = unletterboxPoint(rNet.bottomRight(), lb);
+    return QRectF(tl, br);
+}
+
+
+
 CaptureWorker::CaptureWorker(QString hint,bool isToF,int camIdx, QObject* p)
     :QObject(p), hint_(std::move(hint)), isToF_(isToF),camIdx_(camIdx){}
 CaptureWorker::~CaptureWorker(){stop();closeDevice();}
@@ -394,7 +464,7 @@ void CaptureWorker::start()
         fr && GenApi::IsWritable(fr)) {
         double min = fr->GetMin();
         double max = fr->GetMax();
-        double target = 14;
+        double target = 15;
         if (target < min) target = min;
         if (target > max) target = max;
         fr->SetValue(target);
@@ -537,6 +607,22 @@ void CaptureWorker::start()
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
         if (w && GenApi::IsWritable(w)) w->SetValue(640);
         if (h && GenApi::IsWritable(h)) h->SetValue(480);
+
+        GenApi::CEnumerationPtr sel = dMap->GetNode("Scan3dCoordinateSelector");
+        GenApi::CFloatPtr sc = dMap->GetNode("Scan3dCoordinateScale");
+        GenApi::CFloatPtr of = dMap->GetNode("Scan3dCoordinateOffset");
+        if (sel && sc && of) {
+            sel->FromString("CoordinateA");
+            scaleX_ = (float)sc->GetValue();
+            offX_ = (float)of->GetValue();
+            sel->FromString("CoordinateB");
+            scaleY_ = (float)sc->GetValue();
+            offY_ = (float)of->GetValue();
+            sel->FromString("CoordinateC");
+            scaleZ_ = (float)sc->GetValue();
+            offZ_ = (float)of->GetValue();
+        }
+
     }
     else
     {
@@ -586,43 +672,11 @@ void CaptureWorker::start()
     {
         try
         {
-            auto* img = dev_->GetImage(200);
+            auto* img = dev_->GetImage(100);
             if(!img) continue;
-            /*
-            if(!isToF_)
-            {
-                emit frameReady(camIdx_,toQImage2D(img));
-            }
-            else
-            {
-                emit errorOccurred("ToF heatmap not implemented (use Helios example logic).");
-            }
-            */
 
             onFrameRaw(img);
-            //dev_->RequeueBuffer(img);
 
-            /* Debug Log
-            static int frameCounter = 0;
-                   if ((++frameCounter % 30) == 0)
-                   {   // FPS≈30일 때 30프레임=1초 주기
-                       auto pf = GenApi::CEnumerationPtr(dev_->GetNodeMap()->GetNode("PixelFormat"));
-                       QString pfName = "N/A";
-                       if (pf && GenApi::IsReadable(pf))
-                       {
-                           GenICam::gcstring gc = pf->ToString();
-                           pfName = QString::fromLatin1(gc.c_str());   // ✅ 안전 변환
-                       }
-
-                       auto s = dev_->GetTLStreamNodeMap();
-                       auto delivered = GenApi::CIntegerPtr(s->GetNode("StreamDeliveredFrameCount"));
-                       auto dropped   = GenApi::CIntegerPtr(s->GetNode("StreamLostFrameCount"));
-
-                       qDebug() << "[PF]" << pfName
-                                << "delivered=" << (delivered && GenApi::IsReadable(delivered) ? (long long)delivered->GetValue() : -1)
-                                << "dropped="   << (dropped   && GenApi::IsReadable(dropped)   ? (long long)dropped->GetValue()   : -1);
-                   }
-             */
         }
         catch (...)
         {
@@ -640,6 +694,8 @@ CameraWorker::CameraWorker(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::CameraWorker)
 {
+    QThread::currentThread()->setObjectName("UIThread");
+
     ui->setupUi(this);
 
     ui->videoLabel->setScaledContents(true);
@@ -673,16 +729,21 @@ CameraWorker::CameraWorker(QWidget *parent)
 
     vis_worker_ = new CaptureWorker("192.168.1.151", /*isToF=*/false, /*camIdx=*/0);
     tof_worker_  = new CaptureWorker("192.168.1.150", /*isToF=*/true,  /*camIdx=*/1);
+    pose_worker_ = new PoseWorker();
+
+    pose_worker_->moveToThread(&pose_thread_);
+    pose_thread_.start();
 
     vis_worker_->moveToThread(&vis_thread_);
     connect(&vis_thread_, &QThread::started, vis_worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, vis_worker_, &CaptureWorker::stop);
-    connect(vis_worker_, &CaptureWorker::frameReady, this, &CameraWorker::onFrame, Qt::QueuedConnection);
+    connect(vis_worker_, &CaptureWorker::frameReady, this,
+            &CameraWorker::onFrame, Qt::QueuedConnection);
     connect(vis_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
 
-
+    tof_thread_.setObjectName("ToFThread");
     tof_worker_->moveToThread(&tof_thread_);
     connect(&tof_thread_, &QThread::started, tof_worker_, &CaptureWorker::start);
     connect(this, &CameraWorker::destroyed, tof_worker_, &CaptureWorker::stop);
@@ -690,6 +751,37 @@ CameraWorker::CameraWorker(QWidget *parent)
     connect(tof_worker_, &CaptureWorker::errorOccurred, this, [this](const QString& m){
       statusBar()->showMessage(m, 3000);
     });
+    //connect(this, &CameraWorker::requestSnapPose, tof_worker_,
+    //        &CaptureWorker::requestSnap, Qt::DirectConnection);
+    connect(tof_worker_, &CaptureWorker::poseRequest,
+            pose_worker_, &PoseWorker::snapPose,
+            Qt::QueuedConnection);
+
+
+
+
+
+    pose_worker_->pPose_ = pPose_;
+    pose_worker_->pose_ = new PoseEstimatorONNX();
+
+
+    connect(&pose_thread_, &QThread::finished, pose_worker_,
+            &QObject::deleteLater);
+
+
+    qRegisterMetaType<QImage>("QImage");
+
+    connect(this, &CameraWorker::requestPoseImage,
+            pose_worker_, &PoseWorker::snapPose,
+            Qt::QueuedConnection);
+
+    //connect(this, &CameraWorker::onSnapPose,
+    //        pose_worker_, &PoseWorker::snapPose, Qt::QueuedConnection);
+
+    connect(pose_worker_, &PoseWorker::poseDone,
+            this, &CameraWorker::onPoseDone,
+            Qt::QueuedConnection);
+
 
     vis_worker_->setSystem(sys_);
     tof_worker_->setSystem(sys_);
@@ -705,11 +797,11 @@ CameraWorker::CameraWorker(QWidget *parent)
         pPose_.inputH     = 640;
         pPose_.letterbox  = true;
         pPose_.confDet    = 0.25f;   // bbox/obj 임계
-        pPose_.confKpt    = 0.20f;   // 키포인트 표시 임계
-        pPose_.nmsIoU     = 0.45f;
+        pPose_.confKpt    = 0.25f;   // 키포인트 표시 임계
+        pPose_.nmsIoU     = 0.50f;
         pPose_.rgbInput   = true;    // Gray8 → RGB(복제)로 넣을 것
 
-        poseReady_ = pose_->init("/home/CameraWorker/models/yolov8n-pose.onnx", pPose_, /*threads*/2);
+        poseReady_ = pose_->init("/home/CameraWorker/models/yolo11m-pose.onnx", pPose_, /*threads*/2);
     }
     connect(ui->btnCapture, &QPushButton::clicked, this, &CameraWorker::requestCapture);
 
@@ -736,7 +828,8 @@ CameraWorker::~CameraWorker()
       vis_thread_.wait();
       delete vis_worker_;
     }
-
+    pose_thread_.quit();
+    pose_thread_.wait();
     delete ui;
 }
 
@@ -802,6 +895,46 @@ void CameraWorker::doCaptureAndPose()
         inferImg.bytesPerLine(),
         persons
     );
+
+    {
+        // 원본(src) = qimgIn 크기, 네트(net) = pPose_.inputW/H (정사각)
+        const Letterbox lb = makeLetterbox(lastFrame_.width(), lastFrame_.height(),
+                                           pPose_.inputW, pPose_.inputH);
+
+        // (선택) 모델이 이미 원본 좌표로 돌려주는지 빠르게 감지하고 싶다면:
+        // bool looksNet = false;
+        // for (auto& per : persons) {
+        //     if (per.x > qimgIn.width()+8 || per.y > qimgIn.height()+8) { looksNet = true; break; }
+        // }
+        // if (!looksNet) { /* 이미 원본 좌표면 아래 보정 블록을 건너뛰어도 됨 */ }
+
+        // 1) bbox/kpts 언레터박스
+        for (auto& per : persons)
+        {
+            QRectF rNet(per.x, per.y, per.w, per.h);
+            const QRectF rSrc = unletterboxRect(rNet, lb);
+            per.x = rSrc.x(); per.y = rSrc.y();
+            per.w = rSrc.width(); per.h = rSrc.height();
+
+            for (auto& k : per.kpts)
+            {
+                const QPointF ps = unletterboxPoint(QPointF(k.x, k.y), lb);
+                k.x = ps.x(); k.y = ps.y();
+            }
+        }
+
+        // 2) "손 위" 강화: 박스 상단 20% 확장(프레임 밖 오버런 방지)
+        const float topGrow = 0.20f;
+        const float W = float(lastFrame_.width());
+        const float H = float(lastFrame_.height());
+        for (auto& per : persons)
+        {
+            per.y = std::max(0.0f, per.y - per.h * topGrow);
+            per.h = std::min(H - per.y, per.h * (1.0f + topGrow));
+            per.x = std::clamp(per.x, 0.0f, std::max(0.0f, W - 1.0f));
+            per.w = std::min(W - per.x, per.w);
+        }
+    }
 
     if (!ok)
     {
@@ -907,14 +1040,30 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
     }
 }
 
+void CameraWorker::onPoseDone(const QImage &img)
+{
+    lastFrame_ = img;
+    emit frameReady(1,img);
+}
+
 void CameraWorker::handleTermKey(char ch)
 {
     switch (ch)
     {
         case 'k': case 'K':
-            doCaptureAndPose();
-            emit requestCapture();
+            //doCaptureAndPose();
+            requestCapture();
+            emit requestSnapPose();
+            emit requestPoseImage(lastFrame_.copy());
+    case 'v' : case 'V':
+
         break;
+        break;
+            case 'q' : case 'Q':
+            //1분 캡처+ai넣어야할곳
+
+            break;
+
 
         case 'x': case 'X':
             QCoreApplication::quit();
@@ -929,91 +1078,17 @@ void CameraWorker::requestCapture()
     capturePending_.store(true, std::memory_order_release);
 }
 
+
+
 void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
 {
     // 1) 평소처럼 UI로 먼저 전달(원하면 순서 바꿔도 OK)
+    lastFrame_ = qimgIn;
+
     emit frameReady(camIdx, qimgIn);
-
-        onFrame(1,qimgIn);
-
-    // 2) 캡처 트리거 시에만 포즈 추론 + 저장
-    if (!capturePending_.load(std::memory_order_acquire))
-        return;
-
-    const auto ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss_zzz");
-    const QString rawPath  = captureDir_ + "/" + ts + "_raw.png";
-    const QString annPath  = captureDir_ + "/" + ts + "_pose.png";
-    const QString metaPath = captureDir_ + "/" + ts + "_pose.json";
-
-    // 입력 준비 (Gray8 → RGB888)
-    QImage infer = (qimgIn.format()==QImage::Format_RGB888) ? qimgIn
-                   : qimgIn.convertToFormat(QImage::Format_RGB888);
-
-    // 포즈 추론
-    std::vector<PosePerson> persons;
-    if (poseReady_) {
-        pose_->infer(infer.bits(), infer.width(), infer.height(), infer.bytesPerLine(), persons);
-    }
-
-    // 저장: 원본
-    qimgIn.save(rawPath);
+    onFrame(1,qimgIn);
 
 
-
-    // 저장: 오버레이
-    QImage annotated = qimgIn.copy();
-
-    // 간단한 오버레이(키포인트/에지)
-    QPainter p(&annotated);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    QPen edge(Qt::green); edge.setWidth(2);
-    QPen kp(Qt::red);     kp.setWidth(6);
-    QPen box(Qt::yellow); box.setWidth(2);
-
-    static const int EDGES[][2] = {
-        {5,7},{7,9},{6,8},{8,10},{5,6},{11,12},{5,11},{6,12},
-        {11,13},{13,15},{12,14},{14,16},{0,5},{0,6},{0,1},{1,3},{0,2},{2,4}
-    };
-
-    for (const auto& per : persons) {
-        p.setPen(box);  p.drawRect(QRectF(per.x, per.y, per.w, per.h));
-        p.setPen(kp);   for (const auto& k : per.kpts) if (k.conf >= pPose_.confKpt) p.drawPoint(QPointF(k.x, k.y));
-        p.setPen(edge); for (auto e : EDGES){
-            const auto& a=per.kpts[e[0]], &b=per.kpts[e[1]];
-            if (a.conf >= pPose_.confKpt && b.conf >= pPose_.confKpt)
-                p.drawLine(QPointF(a.x,a.y), QPointF(b.x,b.y));
-        }
-    }
-    p.end();
-
-    annotated.save(annPath);
-
-    // 메타 JSON
-    QFile meta(metaPath);
-    if (meta.open(QIODevice::WriteOnly|QIODevice::Truncate)) {
-        QTextStream os(&meta);
-        os << "{\n";
-        os << "  \"timestamp\":\"" << ts << "\",\n";
-        os << "  \"cam_idx\":" << camIdx << ",\n";
-        os << "  \"num_persons\":" << (int)persons.size() << ",\n";
-        os << "  \"persons\":[\n";
-        for (size_t i=0;i<persons.size();++i){
-            const auto& per=persons[i];
-            os << "    {\"bbox\":["<<per.x<<","<<per.y<<","<<per.w<<","<<per.h<<"],\"score\":"<<per.score<<",\"kpts\":[";
-            for (size_t k=0;k<per.kpts.size();++k){
-                const auto& kp = per.kpts[k];
-                os << "["<<kp.x<<","<<kp.y<<","<<kp.conf<<"]";
-                if (k+1<per.kpts.size()) os << ",";
-            }
-            os << "]}";
-            if (i+1<persons.size()) os << ",\n"; else os << "\n";
-        }
-        os << "  ]\n";
-        os << "}\n";
-        meta.close();
-    }
-
-    capturePending_.store(false, std::memory_order_release);
     //emit savedCapture(annPath);
 }
 
@@ -1049,9 +1124,38 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
          }
          else
          {
+
              // ToF: 기존 false color
 
-             ok = ImageRenderHelper::makeDepthFalseColor(copy, 2400, 32000, qimg);
+            float rMin = 0.6;
+            float rMax = 8.0;
+            float zScale = scaleZ_ / 1000;
+            uint16_t zMin = 0.6 / zScale;
+            uint16_t zMax = 8.0 / zScale;
+
+
+
+             ok = ImageRenderHelper::makeDepthFalseColor(copy, zMin, zMax, qimg);
+
+             QImage gimg;
+             //ImageRenderHelper::depthC16ToGray8(copy,zMin,zMax,1.0,true,gimg);
+
+            if(!qimg.isNull())
+            {
+                emit frameReady(camIdx_, qimg);
+
+                if (snapPending_.exchange(false, std::memory_order_acq_rel))
+                {
+                    //snapPose(qimg);
+                    //snapPose(gimg);
+
+                    //emit poseRequest(qimg);
+                    //emit poseRequest(gimg);
+                }
+
+
+                visIdx_ ^= 1;
+            }
          }
 
          try { Arena::ImageFactory::Destroy(copy); } catch (...) {}
@@ -1064,17 +1168,13 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
      {
          lastOk = qimg;
 
-
-         emit frameReady(camIdx_, qimg);
-
-         visIdx_ ^= 1;
      }
-     /*
-     else if (!lastOk.isNull())
-     {
-         emit frameReady(camIdx_, lastOk);
-     }
-     */
+
+}
+
+void CaptureWorker::captureOnceC16()
+{
+    captureOnceFlag_.store(true);
 }
 
 void CameraWorker::onSnapshot()
@@ -1084,4 +1184,179 @@ void CameraWorker::onSnapshot()
       QDir::homePath() + "/shot_" + QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss") + ".png",
       "PNG Images (*.png)");
   if (!path.isEmpty()) lastFrame_.save(path, "PNG");
+}
+
+PoseWorker::PoseWorker(QObject *parent)
+    : QObject(parent)
+{
+
+}
+
+
+
+void PoseWorker::snapPose(const QImage& inImg)
+{
+    qInfo() << "[snapPose] thread=" << QThread::currentThread()
+            << " id=" << (quintptr)QThread::currentThreadId()
+            << " name=" << QThread::currentThread()->objectName();
+
+    //QImage gray;
+    //ImageRenderHelper::depthC16ToGray8(pImg, /*zMin*/ zMin, /*zMax*/ zMax,1.0,true, gray);
+    //gray = mono16ToGray16_QImage(pImg);
+
+    if (inImg.isNull())
+    {
+        qWarning() << "[SnapPose] depthC16ToGray8 failed";
+        return;
+    }
+
+    //AI 파라미터
+    {
+        if (!pose_) pose_ = new PoseEstimatorONNX();
+
+        //추가: 캡처 폴더 준비
+        QDir().mkpath(captureDir_);
+
+        //추가: 포즈 파라미터 & 초기화
+        pPose_.inputW     = 640;
+        pPose_.inputH     = 640;
+        pPose_.letterbox  = true;
+        pPose_.confDet    = 0.20f;   // bbox/obj 임계
+        pPose_.confKpt    = 0.20f;   // 키포인트 표시 임계
+        pPose_.nmsIoU     = 0.55f;
+        pPose_.rgbInput   = true;    // Gray8 → RGB(복제)로 넣을 것
+
+        poseReady_ = pose_->init("/home/CameraWorker/models/yolo11m-pose.onnx", pPose_, /*threads*/2);
+    }
+
+    // 1. 캡처 디렉토리 준비
+        QDir().mkpath(captureDir_);
+
+        // 2. 파일 경로
+        const QString base     = captureDir_ + "/" + tsNow();
+        const QString rawPath  = base + "_raw2.png";
+        const QString posePath = base + "_pose2.png";
+
+        // 3. 이미지 저장 (원본 Gray)
+        if (inImg.save(rawPath))
+            qInfo() << "[K] saved raw:" << rawPath;
+        else
+            qWarning() << "[K] save raw failed:" << rawPath;
+
+        // 4. 이미지 포맷 확인 (모델 입력용)
+        QImage inferImg = inImg;
+        if (pPose_.rgbInput)
+        {
+            // 모델이 RGB를 기대하면 Gray→RGB888(채널 반복)
+            if (inferImg.format() != QImage::Format_RGB888)
+                inferImg = inferImg.convertToFormat(QImage::Format_RGB888);
+        }
+        else
+        {
+            if (inferImg.format() != QImage::Format_Grayscale8)
+                inferImg = inferImg.convertToFormat(QImage::Format_Grayscale8);
+        }
+
+        // 5. 포즈 추론
+        std::vector<PosePerson> persons;
+        bool ok = (pose_ != nullptr) ? pose_->infer(
+                        inferImg.bits(),
+                        inferImg.width(),
+                        inferImg.height(),
+                        inferImg.bytesPerLine(),
+                        persons)
+                                     : false;
+
+
+
+        {
+            // 원본(src) = qimgIn 크기, 네트(net) = pPose_.inputW/H (정사각)
+            const Letterbox lb = makeLetterbox(inImg.width(), inImg.height(),
+                                               pPose_.inputW, pPose_.inputH);
+
+            // (선택) 모델이 이미 원본 좌표로 돌려주는지 빠르게 감지하고 싶다면:
+            // bool looksNet = false;
+            // for (auto& per : persons) {
+            //     if (per.x > qimgIn.width()+8 || per.y > qimgIn.height()+8) { looksNet = true; break; }
+            // }
+            // if (!looksNet) { /* 이미 원본 좌표면 아래 보정 블록을 건너뛰어도 됨 */ }
+
+            // 1) bbox/kpts 언레터박스
+            for (auto& per : persons)
+            {
+                QRectF rNet(per.x, per.y, per.w, per.h);
+                const QRectF rSrc = unletterboxRect(rNet, lb);
+                per.x = rSrc.x(); per.y = rSrc.y();
+                per.w = rSrc.width(); per.h = rSrc.height();
+
+                for (auto& k : per.kpts)
+                {
+                    const QPointF ps = unletterboxPoint(QPointF(k.x, k.y), lb);
+                    k.x = ps.x(); k.y = ps.y();
+                }
+            }
+
+            // 2) "손 위" 강화: 박스 상단 20% 확장(프레임 밖 오버런 방지)
+            const float topGrow = 0.20f;
+            const float W = float(inImg.width());
+            const float H = float(inImg.height());
+            for (auto& per : persons)
+            {
+                per.y = std::max(0.0f, per.y - per.h * topGrow);
+                per.h = std::min(H - per.y, per.h * (1.0f + topGrow));
+                per.x = std::clamp(per.x, 0.0f, std::max(0.0f, W - 1.0f));
+                per.w = std::min(W - per.x, per.w);
+            }
+        }
+
+        if (!ok)
+        {
+            qWarning() << "[K] pose infer failed.";
+            return;
+        }
+
+        qInfo() << "[K] persons =" << persons.size();
+
+        // 6. 스켈레톤 오버레이 그리기 (시각화는 Gray 위에 RGB로)
+        QImage vis = inImg.convertToFormat(QImage::Format_RGB888);
+        {
+            QPainter p(&vis);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            QPen pen(Qt::green);
+            pen.setWidth(3);
+            p.setPen(pen);
+            QFont f = p.font();
+            f.setPointSize(10);
+            p.setFont(f);
+
+            for (size_t pi = 0; pi < persons.size(); ++pi)
+            {
+                const auto& person = persons[pi];
+                const auto& kpts = person.kpts;
+
+                for (int i = 0; i < EDGE_COUNT; ++i)
+                {
+                    int a = EDGES[i][0], b = EDGES[i][1];
+                    if (a < (int)kpts.size() && b < (int)kpts.size()
+                        && kpts[a].conf > 0.2f && kpts[b].conf > 0.2f)
+                    {
+                        p.drawLine(QPointF(kpts[a].x, kpts[a].y),
+                                   QPointF(kpts[b].x, kpts[b].y));
+                    }
+                }
+
+                for (const auto& k : kpts)
+                {
+                    if (k.conf > 0.2f)
+                        p.drawEllipse(QPointF(k.x, k.y), 3, 3);
+                }
+            }
+        }
+
+        // 7. 결과 이미지 저장
+        if (vis.save(posePath))
+            qInfo() << "[K] saved pose overlay:" << posePath;
+        else
+            qWarning() << "[K] save pose failed:" << posePath;
+
 }
