@@ -4,8 +4,10 @@
 #pragma once
 #include <QImage>
 #include <Arena/ArenaApi.h>
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
+
 
 struct XYZ_I16
 {

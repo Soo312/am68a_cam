@@ -5,6 +5,10 @@
 #include <QtCore/Qt>
 #include <TerminalInput.h>
 
+#include <iostream>
+#include <vector>
+#include <string>
+
 
 int main(int argc, char *argv[])
 {
