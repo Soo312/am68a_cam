@@ -11,6 +11,7 @@ SOURCES += main.cpp \
            cameraworker.cpp \
            person_detect_onnx.cpp \
            pose_estimate_onxx.cpp \
+           yolo_pose_ipc.cpp \
            yolox_cpu_min.cpp
 
 HEADERS += cameraworker.h \
@@ -24,7 +25,7 @@ HEADERS += cameraworker.h \
            pose_ipc.hpp \
            skeleton_draw.hpp \
            utilHeader.h \
-           yolo_ipc.hpp
+           yolo_pose_ipc.h
 
 FORMS   += cameraworker.ui
 
@@ -80,4 +81,4 @@ message(LFLAGS=$$QMAKE_LFLAGS)
 message(LIBS=$$LIBS)
 
 DISTFILES += \
-    yolo_srv_rect.py
+    yolo_pose_7060_srv.py

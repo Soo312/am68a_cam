@@ -3,6 +3,7 @@
 
 #include <CaptureWorker.h>
 #include <PoseWorker.h>
+#include <yolo_pose_ipc.h>
 
 class CameraWorker : public QMainWindow {
   Q_OBJECT
@@ -71,7 +72,7 @@ private:
 
   bool poseReady_ = false;
   PoseParams pPose_;
-  QString captureDir_ = "/home/CameraWorker/captures";
+  QString captureDir_ = "/home/CameraWorker/captures1021";
 
   QTimer* poseStreamTimer_ = nullptr;
   std::atomic<bool> poseStreaming_{false};
@@ -84,6 +85,20 @@ private:
   QString batchOutDir_;
 
   bool isusing_yolo = false;
+
+  //yolo_pose
+  std::unique_ptr<YoloPoseIpc> yoloPose_;
+  uint32_t frameCounter_ = 0; //프레임 아이디용
+  QVector<DetBox> lastBoxes_;
+  std::vector<std::vector<Kpt>> lastKpts_;
+  QElapsedTimer detTick_;   // 탐지 호출 주기 제어(10Hz 예시)
+
+  //저장관련 test용
+  void saveNowUi_Img(int camidx);    // 1분 저장 시작 (동기식)
+  void stopUiSave();                 // 중도 중지(옵션)
+  bool    saveOne_     = false;       // Q 눌렀을 때 1회 저장 플래그
+  int     saveOneCam_  = -1;          // 0 또는 1
+
 
 public:
   Arena::ISystem* sys_ = nullptr;

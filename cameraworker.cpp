@@ -25,10 +25,6 @@
 #include "pose_estimate_onnx.h"
 #include "person_detect_onnx.h"
 
-#include "yolo_ipc.hpp"
-
-std::unique_ptr<YoloIpc> yolo_;
-quint32 frameCounter_ = 0;
 
 using namespace std;
 
@@ -599,7 +595,7 @@ void CaptureWorker::start()
     if(modelname == "HTR003S-001")
     {
         //2D
-        bool ok = setPF("Coord3D_C16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
+        bool ok = setPF("Mono16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
         //3D 인데 프레임끊김이 좀심함
@@ -636,6 +632,7 @@ void CaptureWorker::start()
     }
     else
     {
+        //가시광 카메라
         if (auto pf = GenApi::CEnumerationPtr(dMap->GetNode("PixelFormat")); GenApi::IsWritable(pf))
         {
             //TRIO32S-CC 는 BayerRG8 적용
@@ -645,8 +642,8 @@ void CaptureWorker::start()
         }
         auto w = GenApi::CIntegerPtr(dMap->GetNode("Width"));
         auto h = GenApi::CIntegerPtr(dMap->GetNode("Height"));
-        //if (w && GenApi::IsWritable(w)) w->SetValue(2048);
-        //if (h && GenApi::IsWritable(h)) h->SetValue(1500);
+        if (w && GenApi::IsWritable(w)) w->SetValue(2048);
+        if (h && GenApi::IsWritable(h)) h->SetValue(1536);
 
         auto width = w->GetValue("Width");
         auto height = h->GetValue("Height");
@@ -824,17 +821,15 @@ CameraWorker::CameraWorker(QWidget *parent)
 
     }
 
-    yolo_ = std::make_unique<YoloIpc>("/tmp/yolo.sock");
-    if (!yolo_->connectServer())
-    {
-        qWarning() << "YOLO IPC: connect failed (server not running?)";
-    }
+    yoloPose_ = std::make_unique<YoloPoseIpc>("/tmp/yolo_pose.sock");
 
     connect(ui->btnCapture, &QPushButton::clicked, this, &CameraWorker::requestCapture);
 
     connect(ui->btnStart,   &QPushButton::clicked, this, &CameraWorker::onStart);
     connect(ui->btnSnapshot,&QPushButton::clicked, this, &CameraWorker::onSnapshot);
 
+
+    detTick_.invalidate();
 }
 
 
@@ -907,69 +902,151 @@ void CameraWorker::togglePoseStreaming()
 void CameraWorker::onStart()
 {
 
-    if (!tof_thread_.isRunning())
-        tof_thread_.start();
+    //if (!tof_thread_.isRunning())
+        //tof_thread_.start();
     /*QTimer::singleShot(600, this, [this]{
         if (!vis_thread_.isRunning())
             vis_thread_.start();
     });*/
-   //vis_thread_.start();
+   vis_thread_.start();
 
 }
+
+void CameraWorker::saveNowUi_Img(int camidx)
+{
+    saveOne_    = true;
+    saveOneCam_ = camidx;
+}
+
+
+
 
 void CameraWorker::onFrame(int camidx ,const QImage& img)
 {
     if(img.isNull())return;
     lastFrame_ = img;
 
-    QVector<DetBox> boxes;
-    if (yolo_) {
-        boxes = yolo_->detect(img, frameCounter_++);
-    }
+    QImage resizeimg;
+    //크기 보정
+    if(img.width() > 640 || img.height() > 480)
+    {
+        Qt::TransformationMode mode = true ? Qt::SmoothTransformation
+                                             : Qt::FastTransformation;
 
-    // 원본 640x480 위에 그리기 (전송 해상도 320x240 기준 좌표이므로 스케일 보정)
-    // 2) 오버레이 (320x240 → 원본 스케일)
-    QImage vis = img.copy();
+        resizeimg = lastFrame_.scaled(640,480,Qt::IgnoreAspectRatio,mode);
+    }
+    else
+        resizeimg = img;
+
+
+    // 1) 서버에 보낼 frame_id
+    static quint32 fid = 0;
+
+    // 2) 탐지 호출 주기: 100ms(=10Hz)마다 1회만 IPC 호출
+    if (!detTick_.isValid()) detTick_.start();
+    const bool doDetect = (detTick_.elapsed() >= 100); // 필요 시 66으로(≈15Hz)
+
+    QVector<DetBox> boxes;
+    std::vector<std::vector<Kpt>> kpts; // 박스와 1:1 매칭되는 키포인트들
+
+    if (yoloPose_ && doDetect) {
+        // 새 결과 요청
+        auto newBoxes = yoloPose_->detect(resizeimg, fid++);
+        if (!newBoxes.isEmpty()) {
+            lastBoxes_ = newBoxes;
+            lastKpts_  = yoloPose_->lastKpts(); // detect 직후의 kpts 스냅샷
+        }
+        detTick_.restart();
+    }
+    // 그리기는 항상 "마지막으로 확보된" 결과로
+    boxes = lastBoxes_;
+    kpts  = lastKpts_;
+
+    // 3) 원본에 오버레이 (서버결과 좌표계 320x240 → 원본 스케일 보정) 이엇는데 아님 걍 1
+    QImage vis = resizeimg.copy();
     QPainter p(&vis);
     p.setRenderHint(QPainter::Antialiasing, true);
+
+    const float sx = 1;
+    const float sy = 1;
+
+    // 박스
     p.setPen(QPen(Qt::green, 2));
     QFont f = p.font(); f.setPointSizeF(10); p.setFont(f);
-    const float sx = float(img.width())  / 320.0f;
-    const float sy = float(img.height()) / 240.0f;
-    for (const auto& b : boxes)
-    {
-        const QRectF r(sx*b.x1, sy*b.y1, sx*(b.x2-b.x1), sy*(b.y2-b.y1));
+    for (const auto& b : boxes) {
+        QRectF r(sx*b.x1, sy*b.y1, sx*(b.x2-b.x1), sy*(b.y2-b.y1));
         p.drawRect(r);
-        // 점수 라벨
-        const QString label = QString::asprintf("person %.2f", b.score);
+        QString label = QString::asprintf("person %.2f", b.score);
         p.drawText(QPointF(r.x(), std::max(0.0, r.y()-2.0)), label);
     }
+
     // --- 스켈레톤 (서버에서 kpts 제공 시) ---
-    if (yolo_) {
-        const auto& all = yolo_->lastKpts();
+    if (!kpts.empty())
+    {
         p.setPen(QPen(Qt::yellow, 2));
         auto drawPt   = [&](float x,float y){ p.drawEllipse(QPointF(sx*x, sy*y), 2, 2); };
         auto drawLine = [&](float x1,float y1,float x2,float y2){
             p.drawLine(QPointF(sx*x1, sy*y1), QPointF(sx*x2, sy*y2));
         };
-        // COCO 17점 연결(모델에 따라 다를 수 있음)
+
+        // COCO 17 keypoints 연결(모델에 따라 다를 수 있음)
         static const int E[][2] = {
             {5,7},{7,9}, {6,8},{8,10}, {11,13},{13,15}, {12,14},{14,16},
             {5,6},{11,12},{5,11},{6,12},{0,5},{0,6}
         };
-        for (int i=0; i<boxes.size() && i<all.size(); ++i) {
-            const auto& kp = all[i];
-            // 점
-            for (const auto& k : kp) if (k.score>0.f) drawPt(k.x, k.y);
-            // 선
-            auto ok=[&](int idx){ return idx>=0 && idx<(int)kp.size() && kp[idx].score>0.f; };
-            for (auto& e : E)
-                if (ok(e[0]) && ok(e[1]))
+
+        for (int i = 0; i < boxes.size() && i < (int)kpts.size(); ++i)
+        {
+            const auto& kp = kpts[i];
+
+            // ✅ 이름 충돌 피하려고 ok 대신 hasKpt 사용 + bool 반환 보장
+            auto hasKpt = [&](int idx) -> bool {
+                return (idx >= 0) && (idx < (int)kp.size()) && (kp[idx].score > 0.f);
+            };
+
+            // 점 그리기
+            for (const auto& k : kp) {
+                if (k.score > 0.f) drawPt(k.x, k.y);
+            }
+            // 선 그리기
+            for (const auto& e : E) {
+                if (hasKpt(e[0]) && hasKpt(e[1])) {
                     drawLine(kp[e[0]].x, kp[e[0]].y, kp[e[1]].x, kp[e[1]].y);
+                }
+            }
         }
     }
-
     p.end();
+
+    if (saveOne_ && (saveOneCam_ == camidx))
+    {
+        QDir root(captureDir_);
+        if (!root.exists())
+        {
+            root.mkpath(".");
+        }
+
+        const QString ts   = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmsszzz");
+        const QString base = QString("snap_cam%1_%2").arg(camidx).arg(ts);
+        const QString path = root.filePath(base + ".jpg");
+
+        if (!vis.isNull())
+        {
+            const bool ok = vis.save(path, "JPG", 90); // 화면에 보이는 오버레이 포함 저장
+            if (ok)
+            {
+                qInfo() << "[UI SAVE] one-shot saved ->" << path;
+            }
+            else
+            {
+                qWarning() << "[UI SAVE] save failed ->" << path;
+            }
+        }
+
+        // 한 번만 저장하고 플래그 해제
+        saveOne_    = false;
+        saveOneCam_ = -1;
+    }
 
     // 화면은 즉시 갱신 (끊김 방지)
     if (camidx == 0) ui->videoLabel->setPixmap(QPixmap::fromImage(vis));
@@ -1035,7 +1112,7 @@ void CameraWorker::handleTermKey(char ch)
         break;
             case 'q' : case 'Q':
             //1분 캡처+ai넣어야할곳
-
+            saveNowUi_Img(0);
             break;
 
 
@@ -1064,9 +1141,7 @@ void CameraWorker::onFrameReady(int camIdx, const QImage &qimgIn)
     // 1) 평소처럼 UI로 먼저 전달(원하면 순서 바꿔도 OK)
     lastFrame_ = qimgIn;
 
-    emit frameReady(camIdx, qimgIn);
-
-    onFrame(1,qimgIn);
+    onFrame(camIdx,qimgIn);
 
     // 스트리밍이 켜져 있고, 75ms 주기가 지난 경우에만 1장 전달
     if (poseStreaming_)
@@ -1115,6 +1190,8 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
                  qimg = TightCopyToQImage_StrideAware(copy);
              }
              ok = !qimg.isNull();
+             if(ok)
+                 emit frameReady(camIdx_,qimg);
          }
          else
          {
