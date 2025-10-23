@@ -595,7 +595,7 @@ void CaptureWorker::start()
     if(modelname == "HTR003S-001")
     {
         //2D
-        bool ok = setPF("Mono16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
+        bool ok = setPF("Coord3D_C16"); //Coord3D_C16 은 2D에서 HeatMap만 보여줄때 적절 Coord3D_ABCY16은 3D 모델링할때 적절
         if (!ok) ok = setPF("Range");       // 또는 "Coord3D_Z16", "Confidence16" 등 장치 메뉴 확인
         if (!ok) ok = setPF("Coord3D_C16"); // 반복 시도 가능
         //3D 인데 프레임끊김이 좀심함
@@ -712,6 +712,16 @@ CameraWorker::CameraWorker(QWidget *parent)
     ui->videoLabel_2->setScaledContents(true);
     ui->videoLabel_2->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Ignored);
     ui->videoLabel_2->setAlignment(Qt::AlignCenter);
+
+    // FPS 측정 타이머 설정 코드 추가
+    fpsTimer_ = new QTimer(this);
+    connect(fpsTimer_, &QTimer::timeout, this, [this]() {
+        // 5초마다 실행될 람다 함수
+        const double fps = frameCount_.load() / 5.0;
+        statusBar()->showMessage(QString("FPS: %1").arg(fps, 0, 'f', 2), 4000); // 4초간 표시
+        frameCount_.store(0); // 프레임 카운터 초기화
+    });
+    fpsTimer_->start(5000); // 5000ms = 5초
 
 
     //"192.168.1.150";//HTR003S-001     //"192.168.1.151";//TRI032S-CC
@@ -902,13 +912,13 @@ void CameraWorker::togglePoseStreaming()
 void CameraWorker::onStart()
 {
 
-    //if (!tof_thread_.isRunning())
-        //tof_thread_.start();
+    if (!tof_thread_.isRunning())
+        tof_thread_.start();
     /*QTimer::singleShot(600, this, [this]{
         if (!vis_thread_.isRunning())
             vis_thread_.start();
     });*/
-   vis_thread_.start();
+   //vis_thread_.start();
 
 }
 
@@ -1051,6 +1061,8 @@ void CameraWorker::onFrame(int camidx ,const QImage& img)
     // 화면은 즉시 갱신 (끊김 방지)
     if (camidx == 0) ui->videoLabel->setPixmap(QPixmap::fromImage(vis));
     else             ui->videoLabel_2->setPixmap(QPixmap::fromImage(vis));
+
+    frameCount_++;
 
 }
 
@@ -1209,23 +1221,11 @@ void CaptureWorker::onFrameRaw(Arena::IImage *img)
              ok = ImageRenderHelper::makeDepthFalseColor(copy, zMin, zMax, qimg);
 
              QImage gimg;
-             //ImageRenderHelper::depthC16ToGray8(copy,zMin,zMax,1.0,true,gimg);
+             //ImageRenderHelper::depthC16ToGray8(copy,zMin,zMax,1.0,true,qimg);
 
             if(!qimg.isNull())
             {
                 emit frameReady(camIdx_, qimg);
-
-                if (snapPending_.exchange(false, std::memory_order_acq_rel))
-                {
-                    //snapPose(qimg);
-                    //snapPose(gimg);
-
-                    //emit poseRequest(qimg);
-                    //emit poseRequest(gimg);
-                }
-
-
-                visIdx_ ^= 1;
             }
          }
 

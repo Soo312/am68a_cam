@@ -109,3 +109,69 @@ bool ImageRenderHelper::makeDepthFalseColor(Arena::IImage *img,
     return !outBGR.isNull();
 
 }
+bool ImageRenderHelper::depthC16ToGray8(
+    Arena::IImage* pIn,
+    uint16_t zMin,
+    uint16_t zMax,
+    double gamma,
+    bool invert,
+    QImage& out_qimg)
+{
+    // 1. 입력 이미지 포인터 유효성 검사
+    if (!pIn) {
+        return false;
+    }
+
+    // 2. (수정) 픽셀 포맷 이름을 직접 비교하는 대신, 픽셀 당 비트(bpp)가 16인지 확인합니다.
+    //    Mono16, Coord3D_C16 등 대부분의 16비트 뎁스 데이터에 대응할 수 있습니다.
+    if (pIn->GetBitsPerPixel() != 16) {
+        return false;
+    }
+
+    const int w = static_cast<int>(pIn->GetWidth());
+    const int h = static_cast<int>(pIn->GetHeight());
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+
+    // 3. 소스 데이터 포인터 및 스트라이드(stride) 가져오기
+    const uint8_t* pSrcData = pIn->GetData();
+    const size_t srcStride = calcStepBytes(pIn);
+
+    // 4. 8비트 흑백 출력 이미지 생성
+    out_qimg = QImage(w, h, QImage::Format_Grayscale8);
+    if (out_qimg.isNull()) {
+        return false;
+    }
+
+    // 5. 정규화를 위한 값 계산 (0으로 나누기 방지)
+    const float range = static_cast<float>(zMax - zMin);
+    if (range <= 0) {
+        out_qimg.fill(0); // 범위를 알 수 없으면 검은색 이미지로 채우고 반환
+        return true;
+    }
+    const float scale = 1.0f / range;
+    const float inv_gamma = (gamma > 0.0) ? (1.0f / static_cast<float>(gamma)) : 1.0f;
+
+    // 6. 픽셀 단위로 변환 작업 수행
+    for (int y = 0; y < h; ++y) {
+        const uint16_t* pSrcLine = reinterpret_cast<const uint16_t*>(pSrcData + y * srcStride);
+        uint8_t* pDstLine = out_qimg.scanLine(y);
+
+        for (int x = 0; x < w; ++x) {
+            uint16_t z16 = pSrcLine[x];
+            z16 = std::max(zMin, std::min(z16, zMax));
+            float normalized = static_cast<float>(z16 - zMin) * scale;
+
+            if (invert) {
+                normalized = 1.0f - normalized;
+            }
+            if (inv_gamma != 1.0f) {
+                normalized = std::pow(normalized, inv_gamma);
+            }
+            pDstLine[x] = static_cast<uint8_t>(normalized * 255.0f);
+        }
+    }
+
+    return true;
+}

@@ -100,6 +100,10 @@ private:
   int     saveOneCam_  = -1;          // 0 또는 1
 
 
+  //fps 측정용
+  QTimer* fpsTimer_ = nullptr;
+  std::atomic<int> frameCount_{0};
+
 public:
   Arena::ISystem* sys_ = nullptr;
 };

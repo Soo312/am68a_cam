@@ -34,6 +34,14 @@ public:
                                   uint16_t iMin,
                                   uint16_t iMax,
                                   QImage& outGray);
+    static bool depthC16ToGray8(
+        Arena::IImage* pIn,
+        uint16_t zMin,
+        uint16_t zMax,
+        double gamma,
+        bool invert,
+        QImage& out_qimg
+    );
 
 private:
     static inline bool isInvalidXYZ(int16_t X, int16_t Y, int16_t Z)
@@ -43,6 +51,7 @@ private:
         return h1 || h2;
     }
     static inline size_t calcStepBytes(Arena::IImage* img);
+
 
 
 };
